@@ -198,17 +198,35 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py     # 28 tests, stdlib unittest, no Hermes install required
-hermes plugins validate ./    # the catalog CI gate
+python3 tests/selftest.py                                   # 28 tests, stdlib unittest, no Hermes install
+~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
+hermes plugins validate ./                                  # the catalog CI gate
 ```
 
-The suite covers, among others: unknown sender refused under `closed`; invite admitted once and only
-once; guest tools blocked with a role-naming refusal; a member's sensitive tool escalated to the
-owner's DM and denied on timeout; the prompt going to `chat_id == owner`, not the asker; an approved
-code letting the tool run once; delivery failure failing closed; the session map surviving a restart;
-a cold session blocked; per-person memory never leaking across people; shared facts visible to all; a
-guest refused when publishing; machine-generated turns skipping identity resolution; the audit
-counting turns/tools/refusals/tokens; and the daily budget blocking the next turn.
+`tests/selftest.py` drives the plugin with stub contexts and covers, among others: unknown sender
+refused under `closed`; invite admitted once and only once; guest tools blocked with a role-naming
+refusal; a member's sensitive tool escalated to the owner's DM and denied on timeout; the prompt
+going to `chat_id == owner`, not the asker; an approved code letting the tool run once; delivery
+failure failing closed; the session map surviving a restart; a cold session blocked; per-person
+memory never leaking across people; shared facts visible to all; a guest refused when publishing;
+machine-generated turns skipping identity resolution; the audit counting
+turns/tools/refusals/tokens; and the daily budget blocking the next turn.
+
+`tests/live_integration.py` is the half that unit tests cannot prove: it copies the plugin into a
+throwaway `HERMES_HOME`, loads it through the **real** `PluginManager`, and then drives the host's
+own dispatch — `hermes_cli.lifecycle.invoke_hook("pre_llm_call", …)`,
+`hermes_cli.plugins.get_pre_tool_call_directive(…)`, `tools.registry.dispatch(…)` and a real
+`ApprovalRequest` from `hermes_cli.approval_transport`. Last run:
+
+```
+member_card     [manyhands] This turn's speaker is Minh (member, id telegram:222) …
+stranger        blocked by the invite policy
+member+terminal "block"        member+web_search  None
+cold session    "block"        owner+terminal     None
+no gateway      deny in 0.0 s  (fails closed, never falls back to the asking chat)
+no answer       deny at  5.0 s (the configured cap) — prompt went to telegram:111, not telegram:222
+LIVE INTEGRATION: PASS
+```
 
 ## Development
 
