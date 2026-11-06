@@ -1,0 +1,59 @@
+name: manyhands
+version: 0.1.0
+manifest_version: 2
+api_version: 1
+description: >-
+  One Hermes, many people. Every sender who talks to your bot gets their own identity, their own
+  memory namespace, their own tool allowlist and their own approvals — and the owner can see who
+  asked for what. Resolves (platform, sender_id) in pre_llm_call, enforces a role -> tool allowlist
+  in pre_tool_call, escalates anything sensitive to the owner's DM through a registered approval
+  transport, and keeps turns, refusals, approvals and token usage in a local SQLite audit trail.
+  Six tools, one slash command, no third-party dependencies.
+author: PhiBao
+license: MIT
+homepage: https://github.com/PhiBao/manyhands
+tags: [multi-user, permissions, roles, approvals, memory, identity, household, team]
+requires_hermes: ">=0.19"
+provides_tools:
+  - manyhands_whoami
+  - manyhands_people
+  - manyhands_remember
+  - manyhands_recall
+  - manyhands_share
+  - manyhands_audit
+provides_hooks:
+  - pre_llm_call
+  - pre_tool_call
+  - post_api_request
+config_schema:
+  unknown_sender_policy:
+    type: string
+    default: invite
+    description: "What to do with a sender who is not on the roster: invite (refuse until they redeem a code), open (auto-guest), closed (refuse)."
+  invite_role:
+    type: string
+    default: member
+    description: "Role a person gets when they redeem an invite code."
+  max_person_facts:
+    type: int
+    default: 8
+    description: "How many of a person's own facts are injected into their turns."
+  max_shared_facts:
+    type: int
+    default: 5
+    description: "How many shared facts are injected into every turn."
+  approval_timeout_s:
+    type: int
+    default: 120
+    description: "How long the owner's DM approval waits before failing closed."
+  approval_tools:
+    type: list
+    description: "Tools a non-owner may use only with the owner's approval. Defaults to terminal, execute_code, write_file, patch, browser_exec, delegate_task, cronjob_manage, memory, computer_use, process_manage."
+  unknown_session_policy:
+    type: string
+    default: guest
+    description: "A session with no human turn on it (restart, subagent, socket): guest fails closed, operator trusts the host."
+  paused:
+    type: bool
+    default: false
+    description: "Switch enforcement off at runtime with /many pause; this is the persisted default."

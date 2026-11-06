@@ -1,0 +1,409 @@
+"""manyhands — the six tools. Every handler returns a JSON string and never raises."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from . import identity, policy, store
+
+
+def _err(message: str, **extra: Any) -> str:
+    return json.dumps({"error": message, **extra}, ensure_ascii=False)
+
+
+def _ok(**payload: Any) -> str:
+    return json.dumps(payload, ensure_ascii=False, default=str)
+
+
+def _caller(rt, session_id: str) -> dict[str, Any]:
+    """Who is calling this tool.
+
+    Tool dispatch carries no sender identity, so this resolves the same way ``pre_tool_call`` does:
+    the turn's map, then the persisted session row, then fail closed as an unidentified guest.
+    """
+    person, _ = rt.person_for_session(session_id or "")
+    if person is None:
+        return {"person_id": None, "role": policy.GUEST, "tools": [], "display": "unknown session"}
+    return person
+
+
+def _is_owner(person: dict[str, Any]) -> bool:
+    return str(person.get("role") or "") == "owner"
+
+
+# --------------------------------------------------------------------------- whoami
+
+
+def whoami(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        person = _caller(rt, session_id)
+        role = policy.normalize_role(person.get("role"))
+        named = person.get("tools") or policy.ROLE_TOOLS.get(role, [])
+        pid = person.get("person_id")
+        facts = store.count_facts(rt.conn, pid) if pid and pid != identity.OPERATOR else 0
+        return _ok(
+            person=identity.label(person),
+            person_id=pid,
+            role=role,
+            platform=person.get("platform"),
+            tools=named,
+            tool_count="all" if "*" in (named or []) else len(named or []),
+            facts=facts,
+            paused=rt.paused,
+            enforcement=(
+                "paused by the owner — nothing is being enforced"
+                if rt.paused
+                else "every tool call is checked against this role"
+            ),
+        )
+    except Exception as exc:
+        return _err(f"whoami failed: {exc.__class__.__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- people
+
+
+def people(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        conn = rt.conn
+        caller = _caller(rt, session_id)
+        action = str(args.get("action") or "list").strip().lower()
+
+        if action == "list":
+            rows = store.list_people(conn)
+            return _ok(
+                count=len(rows),
+                people=[
+                    {
+                        "person_id": row["person_id"],
+                        "name": row.get("name") or row.get("display") or row.get("sender_id"),
+                        "platform": row.get("platform"),
+                        "role": policy.normalize_role(row.get("role")),
+                        "summary": policy.describe_role(row.get("role") or "", row.get("tools")),
+                        "facts": store.count_facts(conn, row["person_id"]),
+                        "daily_tokens": int(row.get("daily_tokens") or 0),
+                    }
+                    for row in rows
+                ],
+                open_invites=len(store.open_invites(conn)),
+            )
+
+        if not _is_owner(caller):
+            return _err(
+                "only the owner can change the roster",
+                you=identity.label(caller),
+                role=policy.normalize_role(caller.get("role")),
+            )
+
+        if action == "add":
+            platform = str(args.get("platform") or "").strip()
+            sender = str(args.get("sender_id") or "").strip()
+            if not platform or not sender:
+                return _err("add needs platform and sender_id (e.g. platform='telegram', sender_id='12345')")
+            role = policy.normalize_role(args.get("role") or policy.GUEST)
+            person = store.add_person(
+                conn,
+                platform=platform,
+                sender_id=sender,
+                role=role,
+                name=args.get("name"),
+                tools=[str(t) for t in (args.get("tools") or [])],
+                daily_tokens=int(args.get("daily_tokens") or 0),
+            )
+            rt.audit(kind="policy", person_id=person.get("person_id"), note=f"added as {role}")
+            return _ok(
+                added=person.get("person_id"),
+                role=role,
+                summary=policy.describe_role(role, person.get("tools")),
+            )
+
+        target = str(args.get("name") or args.get("person") or "").strip()
+        if not target:
+            return _err(f"{action} needs a name (a roster name or a person_id)")
+        matches = store.find_by_name(conn, target)
+        if not matches:
+            return _err(f"no person matches {target!r}")
+        if len(matches) > 1:
+            return _err(
+                f"{target!r} matches more than one person",
+                matches=[{"person_id": m["person_id"], "name": m.get("name")} for m in matches],
+            )
+        person = matches[0]
+        pid = person["person_id"]
+
+        if action == "role":
+            role = policy.normalize_role(args.get("role"))
+            if role not in policy.ROLES:
+                return _err(f"role must be one of {', '.join(policy.ROLES)}")
+            if str(person.get("role")) == "owner" and role != "owner":
+                owners = store.owners(conn)
+                if len(owners) <= 1:
+                    return _err("that is the only owner — promote somebody else first")
+            store.set_role(conn, pid, role)
+            rt.audit(kind="policy", person_id=pid, note=f"role -> {role}")
+            return _ok(person=identity.label(person), person_id=pid, role=role,
+                       summary=policy.describe_role(role, person.get("tools")))
+
+        if action == "tools":
+            tokens = [str(t).strip() for t in (args.get("tools") or []) if str(t).strip()]
+            if not tokens:
+                return _err("tools needs a non-empty tools list")
+            store.set_person_tools(conn, pid, tokens)
+            rt.audit(kind="policy", person_id=pid, note=f"tools -> {tokens}")
+            return _ok(person=identity.label(person), person_id=pid, tools=tokens)
+
+        if action == "remove":
+            if str(person.get("role")) == "owner" and len(store.owners(conn)) <= 1:
+                return _err("removing the only owner would lock everybody out")
+            store.remove_person(conn, pid)
+            rt.audit(kind="policy", person_id=pid, note="removed from roster")
+            return _ok(removed=pid)
+
+        return _err(f"unknown action {action!r}", actions=["list", "add", "role", "tools", "remove"])
+    except Exception as exc:
+        return _err(f"people failed: {exc.__class__.__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- memory
+
+
+def remember(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        person = _caller(rt, session_id)
+        pid = person.get("person_id")
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return _err("text is required")
+        if not pid or pid == identity.OPERATOR:
+            return _err("there is no person attached to this conversation, so there is nobody to remember this for")
+        if policy.normalize_role(person.get("role")) == policy.BLOCKED:
+            return _err("that person is blocked and cannot store notes")
+        topic = str(args.get("topic") or "").strip() or None
+        store.add_fact(rt.conn, pid, text, topic=topic, source="tool")
+        rt.audit(kind="memory", person_id=pid, note=f"remember ({topic or 'no topic'})")
+        return _ok(saved=True, for_person=identity.label(person), topic=topic, text=text[:200],
+                   total=store.count_facts(rt.conn, pid))
+    except Exception as exc:
+        return _err(f"remember failed: {exc.__class__.__name__}: {exc}")
+
+
+def recall(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        person = _caller(rt, session_id)
+        pid = person.get("person_id")
+        if not pid or pid == identity.OPERATOR:
+            return _ok(results=[], note="no person attached to this conversation")
+        query = str(args.get("query") or "").strip()
+        limit = max(1, min(int(args.get("limit") or 5), 20))
+        hits = store.search_facts(rt.conn, pid, query, limit=limit) if query else store.list_facts(
+            rt.conn, pid, limit=limit
+        )
+        shared = store.search_shared(rt.conn, query, limit=3) if query else []
+        return _ok(
+            person=identity.label(person),
+            namespace=pid,
+            query=query or None,
+            results=[
+                {"text": hit["text"], "topic": hit.get("topic"), "created_at": hit.get("created_at")}
+                for hit in hits
+            ],
+            shared=[{"text": hit["text"]} for hit in shared],
+            note=(
+                None
+                if hits or shared
+                else f"nothing stored for {identity.label(person)} matches that — do not guess"
+            ),
+        )
+    except Exception as exc:
+        return _err(f"recall failed: {exc.__class__.__name__}: {exc}")
+
+
+def share(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        person = _caller(rt, session_id)
+        role = policy.normalize_role(person.get("role"))
+        if role not in (policy.OWNER, policy.MEMBER):
+            return _err(f"a {role} cannot publish shared facts — ask the owner")
+        text = str(args.get("text") or "").strip()
+        if not text:
+            return _err("text is required")
+        store.add_shared(rt.conn, text, added_by=identity.label(person))
+        rt.audit(kind="memory", person_id=person.get("person_id"), note="shared fact added")
+        return _ok(shared=True, text=text[:200], added_by=identity.label(person),
+                   visible_to=len(store.list_people(rt.conn)))
+    except Exception as exc:
+        return _err(f"share failed: {exc.__class__.__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- audit
+
+
+def audit(rt, args: dict[str, Any], session_id: str = "") -> str:
+    try:
+        caller = _caller(rt, session_id)
+        target = str(args.get("person") or "").strip()
+        hours = float(args.get("hours") or 24)
+        limit = max(1, min(int(args.get("limit") or 25), 100))
+
+        if target and not _is_owner(caller):
+            # Reading somebody else's trail is an owner action; your own is always yours.
+            if target.lower() not in {
+                str(caller.get("person_id") or "").lower(),
+                identity.label(caller).lower(),
+            }:
+                return _err("only the owner can read another person's audit trail")
+
+        person_id = None
+        if target:
+            matches = store.find_by_name(rt.conn, target)
+            if not matches:
+                return _err(f"no person matches {target!r}")
+            person_id = matches[0]["person_id"]
+
+        summary = store.audit_summary(rt.conn, person_id=person_id, hours=hours)
+        rows = store.audit_rows(rt.conn, person_id=person_id, hours=hours, limit=limit)
+        return _ok(
+            subject=target or "everyone",
+            hours=hours,
+            summary=summary,
+            recent=[
+                {
+                    "ts": row.get("ts"),
+                    "kind": row.get("kind"),
+                    "who": row.get("person_id"),
+                    "tool": row.get("tool"),
+                    "allowed": None if row.get("allowed") is None else bool(row["allowed"]),
+                    "needs_approval": None
+                    if row.get("needs_approval") is None
+                    else bool(row["needs_approval"]),
+                    "approved": None if row.get("approved") is None else bool(row["approved"]),
+                    "tokens": row.get("tokens"),
+                    "note": row.get("note"),
+                }
+                for row in rows
+            ],
+            pending_approvals=[
+                {"code": row["code"], "who": row.get("person_id"), "tool": row.get("tool")}
+                for row in store.pending_approvals(rt.conn)
+            ],
+        )
+    except Exception as exc:
+        return _err(f"audit failed: {exc.__class__.__name__}: {exc}")
+
+
+# --------------------------------------------------------------------------- schemas
+
+WHOAMI_SCHEMA = {
+    "name": "manyhands_whoami",
+    "description": (
+        "Who am I talking to, and what are they allowed to do? Returns the caller's roster name, "
+        "their role, the exact tools that role carries and how many private facts are stored for "
+        "them. Use it before offering a capability, so you never promise a tool the person does "
+        "not have."
+    ),
+    "parameters": {"type": "object", "properties": {}, "required": []},
+}
+
+PEOPLE_SCHEMA = {
+    "name": "manyhands_people",
+    "description": (
+        "The roster of people this Hermes serves. action=list shows everyone with their role and "
+        "tool count (anyone may run this). add/role/tools/remove change the roster and are "
+        "owner-only: `add` needs platform + sender_id, `role` and `tools` and `remove` take a name "
+        "or person_id. Roles are owner, member, guest, blocked."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["list", "add", "role", "tools", "remove"],
+                "description": "list (default), or a roster change (owner only).",
+            },
+            "name": {"type": "string", "description": "Roster name or person_id of the target."},
+            "role": {
+                "type": "string",
+                "enum": ["owner", "member", "guest", "blocked"],
+                "description": "Role to assign (action=role) or the role for a new person.",
+            },
+            "tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Explicit tool allowlist for this person (action=tools). Replaces the role default.",
+            },
+            "platform": {"type": "string", "description": "Telegram/Discord/etc. (action=add)."},
+            "sender_id": {"type": "string", "description": "That person's id on the platform (action=add)."},
+            "daily_tokens": {
+                "type": "integer",
+                "description": "Per-day token cap for this person; 0 means unlimited.",
+            },
+        },
+        "required": [],
+    },
+}
+
+REMEMBER_SCHEMA = {
+    "name": "manyhands_remember",
+    "description": (
+        "Store a fact in the CALLER's own memory namespace. It is visible to that person and to "
+        "nobody else, so use it for anything personal: allergies, deadlines, preferences. Quote it "
+        "back when asked."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The fact, in one sentence."},
+            "topic": {"type": "string", "description": "Optional short label, e.g. 'health'."},
+        },
+        "required": ["text"],
+    },
+}
+
+RECALL_SCHEMA = {
+    "name": "manyhands_recall",
+    "description": (
+        "Search the caller's own stored facts (plus facts the owner shared with everybody). An "
+        "empty result means there is nothing to answer from — say that plainly instead of guessing, "
+        "and never use another person's facts to fill the gap."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to look for; omit to list the most recent facts."},
+            "limit": {"type": "integer", "description": "Max results (default 5, max 20)."},
+        },
+        "required": [],
+    },
+}
+
+SHARE_SCHEMA = {
+    "name": "manyhands_share",
+    "description": (
+        "Publish a fact to everyone this Hermes serves (owner or member only). Use it for things "
+        "the whole household or team should know — the wifi password is not one of them."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {"text": {"type": "string", "description": "The shared fact."}},
+        "required": ["text"],
+    },
+}
+
+AUDIT_SCHEMA = {
+    "name": "manyhands_audit",
+    "description": (
+        "Who asked for what: turns, tool calls, refusals, approvals and token usage over the last N "
+        "hours, optionally for one person. Shows the refusals and the escalations that a normal "
+        "chat transcript hides."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "person": {"type": "string", "description": "Roster name or person_id; omit for everyone."},
+            "hours": {"type": "number", "description": "Window in hours (default 24)."},
+            "limit": {"type": "integer", "description": "Max audit rows (default 25, max 100)."},
+        },
+        "required": [],
+    },
+}
