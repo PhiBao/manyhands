@@ -123,9 +123,10 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
                 )
             lines = [f"**roster** — {len(rows)} people"]
             for row in rows:
+                n_facts = store.count_facts(rt.conn, row["person_id"])
                 lines.append(
                     f"- **{identity.label(row)}** · {policy.describe_role(row.get('role') or '', row.get('tools'))}"
-                    f" · {store.count_facts(rt.conn, row['person_id'])} facts"
+                    f" · {n_facts} fact{'' if n_facts == 1 else 's'}"
                     f" · `{row['person_id']}`"
                 )
             invites = store.open_invites(rt.conn)
@@ -291,10 +292,13 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
                 person_id = matches[0]["person_id"]
             summary = store.audit_summary(rt.conn, person_id=person_id, hours=hours)
             rows = store.audit_rows(rt.conn, person_id=person_id, hours=hours, limit=12)
+            def _p(n: int, word: str) -> str:
+                return f"{n} {word}{'' if n == 1 else 's'}"
+
             head = (
                 f"**audit** · last {hours:g}h · "
-                f"{summary['turns']} turns, {summary['tool_calls']} tool calls, "
-                f"{summary['refusals']} refusals, {summary['approvals']} approvals, "
+                f"{_p(summary['turns'], 'turn')}, {_p(summary['tool_calls'], 'tool decision')}, "
+                f"{_p(summary['refusals'], 'refusal')}, {_p(summary['approvals'], 'approval')}, "
                 f"{summary['tokens']:,} tokens"
             )
             body = []
@@ -304,7 +308,9 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
                     bit += f" · {row.get('person_id')}"
                 if row.get("tool"):
                     bit += f" · {row['tool']}"
-                if row.get("allowed") is not None:
+                if row.get("needs_approval"):
+                    bit += " · escalated to the owner"
+                elif row.get("allowed") is not None:
                     bit += " · allowed" if row["allowed"] else " · refused"
                 if row.get("tokens"):
                     bit += f" · {row['tokens']} tok"
