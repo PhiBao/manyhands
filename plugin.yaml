@@ -25,6 +25,10 @@ provides_hooks:
   - pre_llm_call
   - pre_tool_call
   - post_api_request
+# The manifest parser currently ignores this key with a "unknown manifest field" warning, but the
+# validator REQUIRES it ("declared middleware — undeclared middleware registered"), so it stays.
+provides_middleware:
+  - llm_request
 config_schema:
   unknown_sender_policy:
     type: string
