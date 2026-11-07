@@ -1,7 +1,7 @@
 name: manyhands
 title: manyhands
 repo: https://github.com/PhiBao/manyhands
-sha: SHA_PLACEHOLDER
+sha: 7f792aa4c10f9c844ef16d1b1d4a834204da1f53
 version: "0.3.0"
 description: >-
   Identity, memory and permissions for every person who talks to one Hermes bot. A gateway is a
@@ -38,10 +38,10 @@ tier: community
 category: tools
 requires_hermes: ">=0.23.0"
 docs_url: https://github.com/PhiBao/manyhands#readme
-image: https://raw.githubusercontent.com/PhiBao/manyhands/SHA_PLACEHOLDER/docs/approval.png
+image: https://raw.githubusercontent.com/PhiBao/manyhands/7f792aa4c10f9c844ef16d1b1d4a834204da1f53/docs/approval.png
 screenshots:
-  - https://raw.githubusercontent.com/PhiBao/manyhands/SHA_PLACEHOLDER/docs/approval.png
-  - https://raw.githubusercontent.com/PhiBao/manyhands/SHA_PLACEHOLDER/docs/roster.png
+  - https://raw.githubusercontent.com/PhiBao/manyhands/7f792aa4c10f9c844ef16d1b1d4a834204da1f53/docs/approval.png
+  - https://raw.githubusercontent.com/PhiBao/manyhands/7f792aa4c10f9c844ef16d1b1d4a834204da1f53/docs/roster.png
 platforms: []
 known_issues:
   - "Identity is only as good as the platform event: machine-generated turns (cron, internal notices, auto-continuation) are the operator's, and a session that never carried a human turn fails closed — delegation and subagent sessions therefore cannot use restricted tools unless you set unknown_session_policy to operator."
