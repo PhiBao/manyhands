@@ -1,14 +1,19 @@
-"""manyhands — the three hooks.
+"""manyhands — the hooks.
 
 ``pre_llm_call``  is the only place the sender's identity exists (``sender_id`` + ``platform``).
                   It resolves the person, applies the unknown-sender policy, enforces the daily
-                  budget, records ``session_id -> person_id``, and injects that person's card.
+                  budget, records the turn's identity, and injects that person's card.
 ``pre_tool_call`` is where permissions are enforced — but it receives NO sender identity, so it
-                  reads the map written above and fails CLOSED when the map and the database both
-                  come up empty.
+                  reads the map written above and fails CLOSED when every source comes up empty.
 ``post_api_request`` carries the token usage of each model call; it is attributed to whoever owns
-                  the session, which is what makes ``daily_tokens`` and ``manyhands_audit`` real
-                  numbers instead of estimates.
+                  the turn, which is what makes ``daily_tokens`` and ``manyhands_audit`` real numbers
+                  instead of estimates.
+
+Identity is keyed on ``turn_id`` FIRST and ``session_id`` second, because both hooks receive
+``turn_id`` for the same turn while a session can be shared by several people
+(``group_sessions_per_user: false`` — the exact configuration a household picks). With a
+session-only key, two people talking in one shared session would be attributed to whoever spoke
+last, and a tool call from one of them would be judged against the other's role.
 
 Every hook is wrapped: a plugin that raises inside ``pre_llm_call`` breaks every turn of every
 session, so anything unexpected returns ``None`` (do nothing) rather than an exception.
@@ -32,8 +37,13 @@ def build_person_context(rt: Runtime, person: dict[str, Any]) -> str:
     pid = person["person_id"]
     who = identity.label(person)
     role = policy.normalize_role(person.get("role"))
-    tools = policy.ROLE_TOOLS.get(role, []) if not person.get("tools") else person["tools"]
-    tool_line = "every tool" if "*" in (tools or []) else ", ".join(tools or []) or "no tools"
+    card = policy.tool_card(role, person.get("tools"))
+    if "*" in card["allow"]:
+        tool_line = "every tool"
+    else:
+        tool_line = ", ".join(card["allow"]) or "nothing"
+        if card["ask"]:
+            tool_line += f" · needs the owner's approval first: {', '.join(card['ask'])}"
 
     lines = [
         f"[manyhands] This turn's speaker is {who} ({role}, id {pid}). Address them as themselves, "
@@ -75,7 +85,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     # 1. The host talking to itself (cron, internal notices, auto-continuation). Recorded, never
     #    policed — an operator's scheduled job is not a stranger.
     if identity.is_machine_turn(user_message):
-        rt.remember(session_id, identity.OPERATOR, platform or "host")
+        rt.remember(session_id, identity.OPERATOR, platform or "host", turn_id=turn_id)
         rt.audit(
             kind="turn",
             person_id=identity.OPERATOR,
@@ -98,7 +108,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     if person is None:
         if refusal is None:
             # No identity on the event at all: the local CLI seat, which is the operator's own.
-            rt.remember(session_id, identity.OPERATOR, platform or "cli")
+            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id)
             return None
         rt.audit(
             kind="refusal",
@@ -110,22 +120,11 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         return {"action": "block", "message": refusal}
 
     pid = person["person_id"]
-    rt.remember(session_id, pid, platform)
+    rt.remember(session_id, pid, platform, turn_id=turn_id)
 
-    # 3. Owner switch: /many pause stops enforcement and says so in the audit trail.
-    if rt.paused:
-        rt.audit(
-            kind="policy",
-            person_id=pid,
-            session_id=session_id,
-            turn_id=turn_id,
-            note="plugin paused by owner — turn not enforced",
-        )
-        return None
-
-    # 4. Daily budget (0 = unlimited). Tokens are counted from post_api_request, not estimated.
+    # 3. Daily budget (0 = unlimited). Tokens are counted from post_api_request, not estimated.
     cap = int(person.get("daily_tokens") or 0)
-    if cap > 0:
+    if cap > 0 and not rt.paused:
         spent = store.tokens_today(conn, pid)
         if spent >= cap:
             rt.audit(
@@ -145,7 +144,15 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
                 ),
             }
 
-    rt.audit(kind="turn", person_id=pid, session_id=session_id, turn_id=turn_id, note=platform or None)
+    rt.audit(
+        kind="turn",
+        person_id=pid,
+        session_id=session_id,
+        turn_id=turn_id,
+        note=(platform or None) if not rt.paused else "plugin paused by owner — turn not enforced",
+    )
+    # Pause switches ENFORCEMENT off; identity stays. A paused plugin that stops telling the model
+    # who it is talking to is a plugin that looks broken.
     return {"context": build_person_context(rt, person)}
 
 
@@ -182,7 +189,7 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         )
         return None
 
-    person, source = rt.person_for_session(session_id)
+    person, source = rt.person_for_session(session_id, turn_id)
 
     # Fail closed. A session that never carried a human turn (cold start after a restart, a
     # subagent, a tool driven from the socket) gets the guest allowlist unless the operator opts
@@ -192,7 +199,12 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         if str(rt.setting("unknown_session_policy", "guest")).lower() == "operator":
             person = dict(identity.OPERATOR_PERSON)
         else:
-            person = {"person_id": None, "role": policy.GUEST, "tools": [], "display": "unknown session"}
+            person = {
+                "person_id": None,
+                "role": policy.GUEST,
+                "tools": [],
+                "display": "unknown session",
+            }
 
     who = identity.label(person)
     decision = policy.decide(
@@ -204,13 +216,16 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         who=who,
     )
 
-    note = decision["reason"] + (f" (cold session: {source})" if cold else f" ({source})")
+    note = decision["reason"] + (
+        f" (cold session: {source})" if cold else f" ({source})"
+    )
     if cold:
         note += " — failed closed, no human turn on this session"
 
     pid = person.get("person_id")
-    allowed = decision["action"] == policy.ALLOW
-    needs = decision["action"] == policy.APPROVE
+    action = decision["action"]
+    allowed = action == policy.ALLOW
+    needs = action == policy.ASK
 
     rt.audit(
         kind="tool",
@@ -223,7 +238,7 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         note=note,
     )
 
-    if decision["action"] == policy.BLOCK:
+    if action == policy.BLOCK:
         rt.audit(
             kind="refusal",
             person_id=pid,
@@ -250,7 +265,7 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         except Exception:
             pass
         return {
-            "action": "approve",
+            "action": "approve",  # the HOST's directive name for "send this to the approval gate"
             "message": decision["message"],
             "rule_key": decision.get("rule_key") or tool_name,
         }
@@ -279,13 +294,14 @@ def _post_api_request(rt: Runtime, **kwargs: Any) -> None:
     if tokens <= 0:
         return
     session_id = str(kwargs.get("session_id") or "")
-    person, _ = rt.person_for_session(session_id)
+    turn_id = str(kwargs.get("turn_id") or "")
+    person, _ = rt.person_for_session(session_id, turn_id)
     pid = person.get("person_id") if person else None
     rt.audit(
         kind="tokens",
         person_id=pid,
         session_id=session_id,
-        turn_id=str(kwargs.get("turn_id") or ""),
+        turn_id=turn_id,
         tokens=tokens,
         note=str(kwargs.get("model") or ""),
     )

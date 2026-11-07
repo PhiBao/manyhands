@@ -116,8 +116,45 @@ CREATE TABLE IF NOT EXISTS approvals (
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 
+#: Bump when a column is added; ``migrate()`` applies ``COLUMN_ADDITIONS`` idempotently.
+SCHEMA_VERSION = 2
+
+#: ``(table, column, ddl)`` — every upgrade this plugin has ever needed, applied once each.
+COLUMN_ADDITIONS: tuple[tuple[str, str, str], ...] = (
+    ("approvals", "choice", "TEXT"),
+    ("approvals", "summary", "TEXT"),
+    ("audit", "turn_id", "TEXT"),
+)
+
 
 # --------------------------------------------------------------------------- connection
+
+
+def migrate(conn: sqlite3.Connection) -> int:
+    """Create or upgrade the schema, and return the version now in place.
+
+    ``CREATE TABLE IF NOT EXISTS`` alone is not a migration: it never adds a column to a database
+    that already exists, so an install from an earlier version breaks with "no such column" the
+    first time a new field is written. Each upgrade is an idempotent column add, which is all a
+    SQLite plugin needs and is reviewable at a glance.
+    """
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0] or 0)
+    if version < 1:
+        conn.executescript(SCHEMA)
+    for table, column, ddl in COLUMN_ADDITIONS:
+        if column not in _columns(conn, table):
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    if version != SCHEMA_VERSION:
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+    conn.commit()
+    return SCHEMA_VERSION
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.Error:
+        return set()
 
 
 def connect(path: str | Path) -> sqlite3.Connection:
@@ -135,7 +172,7 @@ def connect(path: str | Path) -> sqlite3.Connection:
         conn.execute("PRAGMA synchronous=NORMAL")
     except sqlite3.Error:  # a filesystem that cannot do WAL still works in the default mode
         pass
-    conn.executescript(SCHEMA)
+    migrate(conn)
     conn.commit()
     return conn
 

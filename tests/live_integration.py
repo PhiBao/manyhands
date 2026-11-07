@@ -116,21 +116,68 @@ blocked = [r for r in stranger_hook if isinstance(r, dict) and r.get("action") =
 out["stranger_blocked"] = bool(blocked)
 
 # 2 — the host's real pre_tool_call gate
-def directive(tool, args, session):
+def directive(tool, args, session, turn="turn-1"):
     return P.get_pre_tool_call_directive(
-        tool, args, task_id="t1", session_id=session, tool_call_id="tc", turn_id="turn-1"
+        tool, args, task_id="t1", session_id=session, tool_call_id="tc", turn_id=turn
     )[0]
 
 
 out["member_terminal"] = directive("terminal", {"command": "rm -rf build"}, "sess-minh")
-out["member_web_search"] = directive("web_search", {"query": "x"}, "sess-minh")
-out["cold_session_terminal"] = directive("terminal", {"command": "ls"}, "never-seen")
+# a member's dangerous tool escalates to the owner instead of being refused...
+out["member_recall"] = directive("recall_open", {"path": "/etc/passwd"}, "sess-minh")
+out["member_web_search"] = directive("web_search", {"query": "x"}, "sess-minh", turn="turn-1")
+out["cold_session_terminal"] = directive("terminal", {"command": "ls"}, "never-seen", turn="turn-cold")
 invoke_hook(
     "pre_llm_call", session_id="sess-owner", task_id="t3", turn_id="turn-3",
     user_message="list the build folder", conversation_history=[], is_first_turn=True,
     model="probe", platform="telegram", parent_session_id=None, sender_id="111",
 )
-out["owner_terminal"] = directive("terminal", {"command": "ls"}, "sess-owner")
+out["owner_terminal"] = directive("terminal", {"command": "ls"}, "sess-owner", turn="turn-3")
+
+# 2b — two humans in ONE shared session (group_sessions_per_user: false), two turn ids
+invoke_hook(
+    "pre_llm_call", session_id="one-chat", task_id="t4", turn_id="turn-g", user_message="hi",
+    conversation_history=[], is_first_turn=True, model="probe", platform="telegram",
+    parent_session_id=None, sender_id="333",
+)
+out["shared_session_guest_terminal"] = P.get_pre_tool_call_directive(
+    "terminal", {"command": "ls"}, task_id="t4", session_id="one-chat", tool_call_id="tc-g", turn_id="turn-g"
+)[0]
+out["shared_session_guest_web"] = P.get_pre_tool_call_directive(
+    "web_search", {"query": "x"}, task_id="t4", session_id="one-chat", tool_call_id="tc-g2", turn_id="turn-g"
+)[0]
+
+# 2c — the REAL llm_request middleware chain, from the real registry
+from hermes_cli.middleware import apply_llm_request_middleware  # noqa: E402
+
+RULE = "\u2550" * 46
+host_system = (
+    "You are Hermes.\n\n"
+    f"{RULE}\nMEMORY (your personal notes) [12%]\n{RULE}\nnever share the door code\n\n"
+    f"{RULE}\nUSER PROFILE (who the user is) [9%]\n{RULE}\nKiter, builds things"
+)
+probe_kwargs = {
+    "model": "probe",
+    "messages": [
+        {"role": "system", "content": host_system},
+        {"role": "user", "content": "what do you remember about me?"},
+    ],
+}
+member_mw = apply_llm_request_middleware(
+    probe_kwargs, task_id="t1", turn_id="turn-1", api_request_id="a1",
+    session_id="sess-minh", platform="telegram",
+)
+member_system = member_mw.payload["messages"][0]["content"]
+out["middleware_member_changed"] = bool(member_mw.changed)
+out["middleware_member_memory_withheld"] = "door code" not in member_system
+out["middleware_member_card_injected"] = "[manyhands]" in member_system and "Minh" in member_system
+out["middleware_member_trace"] = member_mw.trace
+
+owner_mw = apply_llm_request_middleware(
+    probe_kwargs, task_id="t3", turn_id="turn-3", api_request_id="a3",
+    session_id="sess-owner", platform="telegram",
+)
+out["middleware_owner_untouched"] = owner_mw.payload["messages"][0]["content"] == host_system
 
 # 3 — a real ApprovalRequest, through the real transport
 from hermes_cli.approval_transport import ApprovalRequest  # noqa: E402
@@ -174,7 +221,8 @@ print("\naudit:", store.audit_summary(rt.conn, hours=1))
 ok = (
     out["member_card_injected"]
     and out["stranger_blocked"]
-    and out["member_terminal"] == "block"
+    and out["member_terminal"] == "approve"   # three-state: a member ASKS, it is not a "no"
+    and out["member_recall"] == "block"       # a tool nobody granted is still a plain no
     and out["member_web_search"] is None
     and out["cold_session_terminal"] == "block"
     and out["owner_terminal"] is None
@@ -182,6 +230,12 @@ ok = (
     and out["no_answer_decision"] == "deny"
     and out["owner_dm_to"] == "telegram:111"
     and out["whoami_via_registry"]["role"] == "member"
+    and out["shared_session_guest_terminal"] == "block"
+    and out["shared_session_guest_web"] is None
+    and out["middleware_member_changed"]
+    and out["middleware_member_memory_withheld"]
+    and out["middleware_member_card_injected"]
+    and out["middleware_owner_untouched"]
 )
 print("\nLIVE INTEGRATION:", "PASS" if ok else "FAIL")
 shutil.rmtree(HOME, ignore_errors=True)

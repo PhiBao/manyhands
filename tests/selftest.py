@@ -48,6 +48,7 @@ store = manyhands.store
 hooks = manyhands.hooks
 tools = manyhands.tools
 transport = manyhands.transport
+middleware = manyhands.middleware
 runtime_mod = manyhands.runtime
 
 
@@ -61,6 +62,7 @@ class FakeCtx:
         self.hooks = {}
         self.commands = {}
         self.transports = {}
+        self.middleware = {}
         self.injected = []
         self.inject_ok = True
 
@@ -78,6 +80,9 @@ class FakeCtx:
 
     def register_approval_transport(self, name, present_fn):
         self.transports[name] = present_fn
+
+    def register_middleware(self, kind, callback):
+        self.middleware[kind] = callback
 
     def inject_message(self, content, role="user", origin=None, session_key=None):
         if not self.inject_ok:
@@ -184,7 +189,7 @@ class ToolPermissions(unittest.TestCase):
     def test_member_gets_an_approval_prompt_for_a_sensitive_tool(self):
         rt = new_runtime()
         seed_roster(rt)
-        store.set_person_tools(rt.conn, store.person_id_for("telegram", "222"), ["terminal"])
+        # no grant, no configuration: asking for a shell command is what a member gets escalated for
         turn(rt, sender="222", session="m1")
         result = hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "rm -rf build"},
                                              session_id="m1", turn_id="t1")
@@ -292,7 +297,6 @@ class Approvals(unittest.TestCase):
     def test_approval_escalates_to_owner_dm_and_times_out_to_deny(self):
         rt = new_runtime({"approval_timeout_s": 2})
         seed_roster(rt)
-        store.set_person_tools(rt.conn, store.person_id_for("telegram", "222"), ["terminal"])
         turn(rt, sender="222", session="m3")
         hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "rm -rf build"}, session_id="m3")
         present = transport.make_transport(rt)
@@ -314,7 +318,6 @@ class Approvals(unittest.TestCase):
     def test_owner_approval_lets_the_tool_run_once(self):
         rt = new_runtime({"approval_timeout_s": 6})
         seed_roster(rt)
-        store.set_person_tools(rt.conn, store.person_id_for("telegram", "222"), ["terminal"])
         turn(rt, sender="222", session="m4")
         hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "npm test"}, session_id="m4")
 
@@ -341,7 +344,6 @@ class Approvals(unittest.TestCase):
     def test_owner_refusal_is_a_deny(self):
         rt = new_runtime({"approval_timeout_s": 6})
         seed_roster(rt)
-        store.set_person_tools(rt.conn, store.person_id_for("telegram", "222"), ["terminal"])
         turn(rt, sender="222", session="m5")
         hooks.make_pre_tool_call(rt)(tool_name="terminal", args={}, session_id="m5")
         import threading
@@ -390,7 +392,9 @@ class TurnsAndAudit(unittest.TestCase):
         rt = new_runtime()
         seed_roster(rt)
         turn(rt, sender="222", session="a1")
+        # a member's dangerous tool is escalated (not a refusal); a tool nobody granted is refused
         hooks.make_pre_tool_call(rt)(tool_name="terminal", args={}, session_id="a1")
+        hooks.make_pre_tool_call(rt)(tool_name="recall_open", args={}, session_id="a1")
         hooks.make_pre_tool_call(rt)(tool_name="web_search", args={}, session_id="a1")
         hooks.make_post_api_request(rt)(usage={"total_tokens": 1234}, session_id="a1", model="m")
         summary = store.audit_summary(rt.conn, hours=1)
@@ -477,6 +481,157 @@ class PolicySurface(unittest.TestCase):
         self.assertEqual(policy.decide(role="owner", tool="anything_at_all")["action"], policy.ALLOW)
 
 
+
+class SharedSession(unittest.TestCase):
+    """The case a household actually configures: one chat, one session, several people."""
+
+    def test_two_people_in_one_session_are_not_confused(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        shared = "family-chat"  # group_sessions_per_user: false
+        member_hook = hooks.make_pre_llm_call(rt)
+        member_hook(user_message="hi", session_id=shared, turn_id="turn-m", platform="telegram", sender_id="222")
+        guest_hook = hooks.make_pre_llm_call(rt)
+        guest_hook(user_message="hi", session_id=shared, turn_id="turn-g", platform="telegram", sender_id="333")
+        tool_hook = hooks.make_pre_tool_call(rt)
+        # the member's own tool call is judged as the member...
+        self.assertIsNone(tool_hook(tool_name="web_search", args={}, session_id=shared, turn_id="turn-m"))
+        # ...and the guest's, sent after the member spoke in the SAME session, as the guest
+        blocked = tool_hook(tool_name="terminal", args={}, session_id=shared, turn_id="turn-g")
+        self.assertEqual(blocked.get("action"), "block")
+        self.assertIn("guest", blocked.get("message", ""))
+        # the member's dangerous tool is escalated, not blocked: the three-state model
+        escalated = tool_hook(tool_name="terminal", args={}, session_id=shared, turn_id="turn-m")
+        self.assertEqual(escalated.get("action"), "approve")
+
+
+class ThreeStates(unittest.TestCase):
+    def test_a_member_is_escalated_rather_than_refused(self):
+        decision = policy.decide(role="member", tool="terminal")
+        self.assertEqual(decision["action"], policy.ASK)
+        self.assertEqual(decision["rule_key"], "terminal")
+
+    def test_a_guest_is_refused_and_never_escalated(self):
+        self.assertEqual(policy.decide(role="guest", tool="terminal")["action"], policy.BLOCK)
+
+    def test_an_explicit_grant_beats_the_ask_bucket(self):
+        decision = policy.decide(role="member", tool="terminal", person_tools=["terminal"])
+        self.assertEqual(decision["action"], policy.ALLOW)
+
+    def test_a_member_cannot_reach_the_operators_files_by_default(self):
+        # `recall_*` greps the operator's own disk through the sibling plugin: it is neither in the
+        # member ALLOW bucket nor in its ASK bucket, so it is a plain no until the owner says so.
+        for tool in ("recall_search", "recall_open"):
+            self.assertNotIn(tool, policy.ROLE_ALLOW[policy.MEMBER])
+            self.assertNotIn(tool, policy.ROLE_ASK[policy.MEMBER])
+            self.assertEqual(policy.decide(role="member", tool=tool)["action"], policy.BLOCK)
+
+    def test_the_roster_hides_platform_ids_from_non_owners(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="333", session="g-roster")
+        guest_view = call_tool(rt, "manyhands_people", session="g-roster")
+        self.assertNotIn("telegram:111", guest_view)
+        turn(rt, sender="111", session="o-roster")
+        owner_view = call_tool(rt, "manyhands_people", session="o-roster")
+        self.assertIn("telegram:111", owner_view)
+
+
+class SchemaUpgrade(unittest.TestCase):
+    def test_an_old_database_is_upgraded_in_place(self):
+        import sqlite3, tempfile, os
+        path = os.path.join(tempfile.mkdtemp(prefix="mh-migrate-"), "old.db")
+        old = sqlite3.connect(path)
+        old.executescript(
+            "CREATE TABLE approvals (code TEXT PRIMARY KEY, created_at REAL, person_id TEXT, "
+            "tool TEXT, request_id TEXT, digest TEXT, status TEXT, decided_by TEXT, decided_at REAL, "
+            "expires_at REAL);"
+        )
+        old.commit()
+        old.close()
+        conn = store.connect(path)  # connect() must migrate, not just CREATE IF NOT EXISTS
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(approvals)")}
+        self.assertIn("choice", cols)
+        self.assertIn("summary", cols)
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], store.SCHEMA_VERSION)
+        conn.close()
+
+
+class HostMemoryScoping(unittest.TestCase):
+    RULE = "\u2550" * 46
+
+    def _system_prompt(self, memory_body="the owner's private notes\n§\nnever share the door code"):
+        return (
+            "You are Hermes.\n\n"
+            f"{self.RULE}\nMEMORY (your personal notes) [12%]\n{self.RULE}\n{memory_body}\n\n"
+            f"{self.RULE}\nUSER PROFILE (who the user is) [9%]\n{self.RULE}\nKiter, builds things"
+        )
+
+    def _request(self):
+        return {"model": "x", "messages": [
+            {"role": "system", "content": self._system_prompt()},
+            {"role": "user", "content": "what do you remember about me?"},
+        ]}
+
+    def test_the_operators_memory_is_withheld_from_a_member(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="mw")
+        out = middleware.make_llm_request_middleware(rt)(
+            request=self._request(), session_id="mw", turn_id="mw")
+        self.assertIsInstance(out, dict)
+        system = out["request"]["messages"][0]["content"]
+        self.assertNotIn("never share the door code", system)
+        self.assertNotIn("USER PROFILE", system)
+        self.assertIn("[manyhands]", system)
+        self.assertIn("Minh", system)
+        # the user's own message is untouched
+        self.assertEqual(out["request"]["messages"][1]["content"], "what do you remember about me?")
+
+    def test_the_owners_own_prompt_is_left_alone(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="111", session="ow")
+        out = middleware.make_llm_request_middleware(rt)(
+            request=self._request(), session_id="ow", turn_id="ow")
+        self.assertIsNone(out)
+
+    def test_an_unknown_session_is_left_alone(self):
+        rt = new_runtime()
+        out = middleware.make_llm_request_middleware(rt)(
+            request=self._request(), session_id="nobody", turn_id="nobody")
+        self.assertIsNone(out)
+
+    def test_junk_in_never_raises(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="jw")
+        mw = middleware.make_llm_request_middleware(rt)
+        for junk in (None, {}, {"messages": "nope"}, {"messages": [None, 5]}, {"system": 42}):
+            self.assertIsNone(mw(request=junk, session_id="jw", turn_id="jw"))
+
+    def test_the_middleware_is_idempotent(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="iw")
+        mw = middleware.make_llm_request_middleware(rt)
+        first = mw(request=self._request(), session_id="iw", turn_id="iw")
+        second = mw(request=first["request"], session_id="iw", turn_id="iw")
+        self.assertIsNone(second, "an already-scoped prompt must not be rewritten again")
+
+
+class PauseKeepsIdentity(unittest.TestCase):
+    def test_pause_stops_enforcement_but_not_the_person_card(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        rt.set_paused(True)
+        result = turn(rt, sender="222", session="p1")
+        self.assertIsInstance(result, dict)
+        self.assertNotIn("action", result)
+        self.assertIn("Minh", result.get("context", ""))
+
+
+
 def main() -> int:
     # the plugin must be importable and register cleanly against a fake context
     ctx = FakeCtx()
@@ -488,6 +643,7 @@ def main() -> int:
     }, ctx.tools.keys()
     assert set(ctx.hooks) == {"pre_llm_call", "pre_tool_call", "post_api_request"}, ctx.hooks
     assert "manyhands" in ctx.transports
+    assert "llm_request" in ctx.middleware, ctx.middleware
     assert "many" in ctx.commands
 
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])

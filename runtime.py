@@ -28,6 +28,8 @@ DEFAULTS: dict[str, Any] = {
     # Whether a session that never carried a human turn may use the tools it asks for.
     # "guest" fails closed for restricted tools; "operator" trusts the host's own callers.
     "unknown_session_policy": "guest",
+    # Strip the host's own MEMORY/USER blocks from a non-owner's system prompt (middleware.py).
+    "scope_host_memory": True,
 }
 
 
@@ -39,6 +41,7 @@ class Runtime:
         self._lock = threading.Lock()
         self._conn = None
         self._hot: dict[str, str] = {}
+        self._hot_turn: dict[str, str] = {}
         self._override_path = Path(db_path) if db_path else None
         key = ""
         for attr in ("plugin_id", "name"):
@@ -116,7 +119,20 @@ class Runtime:
 
     # ------------------------------------------------------------------ session map
 
-    def remember(self, session_id: str, person_id: str, platform: str | None = None) -> None:
+    def remember(
+        self, session_id: str, person_id: str, platform: str | None = None, turn_id: str = ""
+    ) -> None:
+        """Record who is speaking — on the TURN first, and on the session as a fallback.
+
+        Both hooks receive ``turn_id`` for the same turn, but a session can be shared by several
+        people (``group_sessions_per_user: false``). Keyed on the session alone, two people in one
+        chat would be attributed to whoever spoke last; keyed on the turn, they cannot collide.
+        """
+        if turn_id:
+            self._hot_turn[turn_id] = person_id
+            if len(self._hot_turn) > 512:  # bounded: a long-lived gateway must not leak turns
+                for stale in list(self._hot_turn)[:256]:
+                    self._hot_turn.pop(stale, None)
         if not session_id:
             return
         self._hot[session_id] = person_id
@@ -128,8 +144,17 @@ class Runtime:
     def forget(self, session_id: str) -> None:
         self._hot.pop(session_id, None)
 
-    def person_for_session(self, session_id: str) -> tuple[dict[str, Any] | None, str]:
-        return identity.person_for_tool_call(self.conn, session_id=session_id, hot_map=self._hot)
+    def person_for_session(
+        self, session_id: str, turn_id: str = ""
+    ) -> tuple[dict[str, Any] | None, str]:
+        """Resolve the person for a tool call: turn map -> session map -> database -> unknown."""
+        if turn_id:
+            pid = self._hot_turn.get(turn_id)
+            if pid:
+                return identity._load(self.conn, pid), "turn"
+        return identity.person_for_tool_call(
+            self.conn, session_id=session_id, hot_map=self._hot
+        )
 
     # ------------------------------------------------------------------ outbound
 
@@ -177,12 +202,15 @@ class Runtime:
     def paused(self) -> bool:
         return bool(self.setting("paused", False))
 
-    def approval_tools(self) -> list[str]:
+    def approval_tools(self) -> list[str] | None:
+        """The operator's ASK override, or None to use each role's own bucket.
+
+        Returning None matters: a single global list would hand a *guest* the same escalation path
+        as a member, which is a phishing surface (approve a stranger's shell command, in your DM).
+        """
         raw = self.setting("approval_tools", None)
         if isinstance(raw, str) and raw.strip():
             return [t.strip() for t in raw.split(",") if t.strip()]
-        if isinstance(raw, (list, tuple)):
+        if isinstance(raw, (list, tuple)) and raw:
             return [str(t) for t in raw]
-        from .policy import DEFAULT_APPROVAL_TOOLS
-
-        return list(DEFAULT_APPROVAL_TOOLS)
+        return None

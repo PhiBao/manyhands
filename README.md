@@ -15,10 +15,14 @@ the group talks to the same memory, the same toolset and the same approval autho
 the plugin that acts on it.
 
 - **Identity** comes from the platform event, never from message text.
-- **Roles** are an allowlist: `owner`, `member`, `guest`, `blocked`. Anything a role does not name is
-  refused — including tools that ship next year, third-party tools and MCP tools.
+- **Roles** have three states per tool, not two: `allow` (runs), `ask` (the owner's DM decides) and
+  (everything else) `never`. A member who asks for a shell command does not get "no" — they get the
+  owner's phone lighting up. A guest never escalates: prompting the owner on a stranger's behalf is
+  a phishing surface, not a feature. Roles are `owner`, `member`, `guest`, `blocked`.
 - **Approvals** for anything sensitive go to the **owner's DM**, not to whoever is in the room.
-- **Memory** is per person. Their facts are injected into their turns and nobody else's.
+- **Memory** is per person — and the operator's own `MEMORY.md`/`USER.md` is **withheld** from
+  everybody else's system prompt, because "everyone gets their own Hermes" has to include not
+  handing a stranger your notes.
 - **Audit**: turns, tool calls, refusals, approvals and token usage, per person, in local SQLite.
 
 Nothing leaves the machine. No network calls, no third-party dependencies, standard library only.
@@ -59,9 +63,10 @@ conversation does not exist in the marketplace.**
 | tool | `manyhands_recall` | search the caller's facts + shared facts |
 | tool | `manyhands_share` | publish a fact to everyone (owner/member) |
 | tool | `manyhands_audit` | turns, tool calls, refusals, approvals, tokens |
-| hook | `pre_llm_call` | resolve identity, apply the unknown-sender policy, enforce the daily budget, inject the person card, record `session_id → person_id` |
-| hook | `pre_tool_call` | role → tool allowlist; escalate sensitive tools to approval; **fail closed** on unknown sessions |
-| hook | `post_api_request` | attribute token usage to whoever owns the session |
+| hook | `pre_llm_call` | resolve identity, apply the unknown-sender policy, enforce the daily budget, inject the person card, record `turn_id → person_id` (and the session fallback) |
+| hook | `pre_tool_call` | three-state allow/ask/never per role; escalate to approval; **fail closed** on unknown sessions |
+| hook | `post_api_request` | attribute token usage to whoever owns the turn |
+| middleware | `llm_request` | withhold the operator's own MEMORY/USER blocks from a non-owner's system prompt, and put the person card where it belongs (the system prompt) |
 | transport | `manyhands` | present approval prompts in the **owner's DM** under a short code |
 | command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve <code> · deny <code>` |
 
@@ -84,6 +89,7 @@ Then, once:
    security:
      approval:
        transport: manyhands
+       transport_fallback: builtin   # keep the stock prompt for your OWN local/desktop sessions
    plugins:
      entries:
        manyhands:
@@ -91,7 +97,9 @@ Then, once:
    ```
 
 Without step 3 the roles and memory still work; approval prompts then go to the host's own surface
-instead of your DM.
+instead of your DM. **Set `transport_fallback: builtin` if you also work from the CLI or the desktop
+app**: a selected transport replaces *every* approval surface, and with no gateway running there is
+nobody to DM, so the honest answer is a deny — the fallback keeps your own approvals where they were.
 
 ## The safety contract
 
@@ -102,33 +110,46 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
 2. **Fail closed on unknown state.** A session with no human turn on it — a restart, a subagent, a
    tool driven from the socket — gets the guest allowlist, not the owner's
    (`test_cold_session_map_blocks_restricted_tools`).
-3. **Refusals are polite, specific and non-disclosing.** A blocked tool returns a plain-language
-   message naming the person's own role and never what somebody else has access to.
-4. **Nothing is silent.** Every turn, tool decision, refusal, approval and token count is an audit
+3. **Identity is keyed on the turn, not the session.** Two people in one chat session (the
+   `group_sessions_per_user: false` a household configures) are never confused for each other
+   (`test_two_people_in_one_session_are_not_confused`).
+4. **Refusals are polite, specific and non-disclosing.** A blocked tool returns a plain-language
+   message naming the person's own role and never what somebody else has access to. The roster hides
+   platform ids from non-owners (`test_the_roster_hides_platform_ids_from_non_owners`).
+5. **Nothing is silent.** Every turn, tool decision, refusal, approval and token count is an audit
    row; `/many audit` shows them.
-5. **The owner can always act**, and can switch enforcement off with `/many pause` — which writes a
-   loud audit row instead of quietly forgetting.
-6. **Per-person memory is never merged.** No query in this plugin can read another person's facts:
+6. **The owner can always act**, and can switch enforcement off with `/many pause` — which writes a
+   loud audit row instead of quietly forgetting, and still tells the model who it is talking to.
+7. **Per-person memory is never merged.** No query in this plugin can read another person's facts:
    the namespace is a mandatory argument, not a filter.
-7. **Only a human can approve.** `/many approve CODE` is a slash command on the owner's own message;
+8. **The operator's own notes are withheld from everybody else.** `llm_request` middleware strips the
+   host's `MEMORY`/`USER PROFILE` blocks out of a non-owner's system prompt
+   (`test_the_operators_memory_is_withheld_from_a_member`, and for the owner's own prompt
+   `test_the_owners_own_prompt_is_left_alone`).
+9. **Only a human can approve.** `/many approve CODE` is a slash command on the owner's own message;
    there is no tool, hook or prompt path that can approve an escalation. An agent cannot talk itself
    into permission.
-8. **Machine-generated turns are the operator, not a stranger.** Cron prompts, internal notices and
-   auto-continuations are recorded and not policed — otherwise the plugin would lock the owner out
-   of their own scheduled jobs. The `[OUT-OF-BAND USER MESSAGE]` marker is deliberately **not** on
-   that list: the host uses it for mid-turn steering from the same human, and trusting it as the
-   operator would let a guest's steer run with owner tools.
-9. **The allowlist is the whole policy.** A tool nobody named is refused. A denylist fails open on
-   every tool nobody thought of; an allowlist fails closed.
+10. **Machine-generated turns are the operator, not a stranger.** Cron prompts, internal notices and
+    auto-continuations are recorded and not policed — otherwise the plugin would lock the owner out
+    of their own scheduled jobs. The `[OUT-OF-BAND USER MESSAGE]` marker is deliberately **not** on
+    that list: the host uses it for mid-turn steering from the same human, and trusting it as the
+    operator would let a guest's steer run with owner tools.
+11. **Whitelist, not blacklist.** A tool nobody named is refused, including tools that ship next year,
+    third-party plugin tools and MCP tools. A denylist fails open on every tool nobody thought of —
+    which is how a *member's* default tool list once included the tools that grep the operator's own
+    disk (see `test_a_member_cannot_reach_the_operators_files_by_default`, which now pins that shut).
 
-## How the pieces fit (the two gotchas that shaped it)
+## How the pieces fit (the four gotchas that shaped it)
 
 **`pre_tool_call` has no sender identity.** Its payload is `tool_name, args, task_id, session_id,
 tool_call_id, turn_id, api_request_id, middleware_trace`
 (`hermes_cli/plugins.py:1907`, the `_PreToolCallDirective` gate). `pre_llm_call` is the only hook that
-receives `sender_id` + `platform` (`agent/turn_context.py`). So identity is carried across in a
-session map, written on every turn and **persisted in SQLite** so a restart does not lose it. When the
-map and the database both come up empty, the call fails closed.
+receives `sender_id` + `platform` (`agent/turn_context.py`). So identity is carried across in a map
+written on every turn, keyed on **`turn_id` first** and persisted per session in SQLite so a restart
+does not lose it. Turn-first matters: with a session-only key, two people in one shared chat session
+would be attributed to whoever spoke last, and one person's tool call would be judged against the
+other's role. When the turn map, the session map and the database all come up empty, the call fails
+closed.
 
 **The approval transport does not know who asked.** It receives a redacted `ApprovalRequest`
 (`hermes_cli/approval_transport.py`) — command, description, pattern_key, timeout, allowed choices —
@@ -138,10 +159,20 @@ escalation for that tool and turns it into a prompt with a short code. Requests 
 from manyhands (a stock dangerous-command prompt) are still routed to the owner's DM, they just
 cannot name the asker.
 
+**A hook cannot touch the system prompt, but middleware can.** `pre_llm_call` only appends to the
+*user* message, which is where the operator's own `MEMORY.md`/`USER.md` blocks would sail past it into
+a guest's context. `ctx.register_middleware("llm_request", cb)` receives the full provider kwargs plus
+`session_id`/`turn_id`/`platform`, and a returned `{"request": {...}}` replaces what goes to the
+model. That is the seam this plugin uses to withhold the operator's memory from everybody else and to
+put the person card in the system prompt where it belongs. It is deliberately **fail-open** (any
+surprise ⇒ leave the request alone): it is a privacy filter, and `pre_tool_call` is what stops a tool.
+The plugin manifest has no `provides_middleware` field, so the capability is declared in the catalog
+entry instead.
+
 **Return values are directives, not booleans.** `pre_llm_call` accepts `{"context": …}` (appended to
 the user message) or `{"action": "block", "message": …}` (turn ends, no inference). `pre_tool_call`
 accepts `block` / `approve` (escalate to the host's gate) / `modify`, precedence `block > approve >
-modify`.
+modify` — manyhands' `ask` state becomes the host's `approve`.
 
 ## Data model
 
@@ -168,19 +199,21 @@ not an estimate. 0 means unlimited.
 - **Permissions are for the model-driven tool path.** A tool call that never passes
   `pre_tool_call` (a plugin dispatching straight into another tool, a subagent with its own scope)
   is not seen by this plugin. It is a policy layer, not a kernel.
+- **Delegation needs one config flip.** A subagent's session never carried a human turn, so it fails
+  closed at the guest allowlist. If you use `delegate_task`, set `unknown_session_policy: operator`
+  — and understand that it then trusts any caller with no identity.
 - **The owner's DM is Telegram-shaped.** `origin.chat_id` is built from the sender id, which is the
   private-chat id on Telegram. On Discord/Slack the DM channel has to be resolved first; where the
-  plugin cannot address a person directly it **denies** rather than falling back to the room. One
-  transport, one honest platform.
-- **Memory is this plugin's own store.** It is injected as context and exposed through tools; it is
-  not registered as the host's memory provider, so the host's own MEMORY.md is untouched and
-  unscoped. Registering a per-person provider is the natural next step, and was left out on purpose
-  to keep v1's blast radius small.
+  plugin cannot address a person directly it **denies** rather than falling back to the room.
+- **Memory is this plugin's own store, plus a withheld host block.** Per-person facts are injected as
+  context and exposed through tools; the host's own `MEMORY.md`/`USER.md` is *withheld* from
+  non-owners rather than rewritten per person, and an external memory provider's block (a different
+  renderer) is not stripped. Registering a per-person provider is the natural v2.
 - **The token budget is per UTC day**, and a single long turn can overshoot before the next check.
 - **`/many approve` is only as strong as the platform's identity.** If an attacker controls the
   owner's chat account, they are the owner.
-- **A guest can still read anything the *model* says.** Refusing a tool is not the same as refusing
-  a sentence; the shared facts are shared on purpose, per-person facts are not in a guest's context.
+- **A guest can still read anything the *model* says.** Refusing a tool is not the same as refusing a
+  sentence; shared facts are shared on purpose, per-person facts are not in a guest's context.
 
 ## Disclosure — every read, write and network path
 
@@ -198,35 +231,53 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                   # 28 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 41 tests, stdlib unittest, no Hermes install
+python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
-hermes plugins validate ./                                  # the catalog CI gate
+hermes plugins validate ./                                   # the catalog CI gate
 ```
 
 `tests/selftest.py` drives the plugin with stub contexts and covers, among others: unknown sender
-refused under `closed`; invite admitted once and only once; guest tools blocked with a role-naming
-refusal; a member's sensitive tool escalated to the owner's DM and denied on timeout; the prompt
-going to `chat_id == owner`, not the asker; an approved code letting the tool run once; delivery
-failure failing closed; the session map surviving a restart; a cold session blocked; per-person
-memory never leaking across people; shared facts visible to all; a guest refused when publishing;
-machine-generated turns skipping identity resolution; the audit counting
+refused under `closed`; invite admitted once and only once; identity never taken from message text;
+a guest refused with a role-naming message; a member's dangerous tool escalated rather than refused;
+an explicit grant beating the ask bucket; a member unable to reach the operator's files; the roster
+hiding platform ids from non-owners; two people in one shared session never confused; a cold session
+blocked; the session map surviving a restart; an old database upgraded in place; the approval prompt
+going to `chat_id == owner` and timing out to deny; an approved code letting the tool run once;
+delivery failure failing closed; the owner's memory withheld from a member and left alone for the
+owner; per-person memory never leaking; shared facts visible to all; machine-generated turns skipping
+identity resolution; pause dropping enforcement but keeping the person card; the audit counting
 turns/tools/refusals/tokens; and the daily budget blocking the next turn.
 
 `tests/live_integration.py` is the half that unit tests cannot prove: it copies the plugin into a
-throwaway `HERMES_HOME`, loads it through the **real** `PluginManager`, and then drives the host's
-own dispatch — `hermes_cli.lifecycle.invoke_hook("pre_llm_call", …)`,
-`hermes_cli.plugins.get_pre_tool_call_directive(…)`, `tools.registry.dispatch(…)` and a real
-`ApprovalRequest` from `hermes_cli.approval_transport`. Last run:
+throwaway `HERMES_HOME`, loads it through the **real** `PluginManager`, and drives the host's own
+dispatch — `hermes_cli.lifecycle.invoke_hook("pre_llm_call", …)`,
+`hermes_cli.plugins.get_pre_tool_call_directive(…)`, `hermes_cli.middleware.apply_llm_request_middleware(…)`,
+`tools.registry.dispatch(…)` and a real `ApprovalRequest` from `hermes_cli.approval_transport`. Last run:
 
 ```
-member_card     [manyhands] This turn's speaker is Minh (member, id telegram:222) …
-stranger        blocked by the invite policy
-member+terminal "block"        member+web_search  None
-cold session    "block"        owner+terminal     None
-no gateway      deny in 0.0 s  (fails closed, never falls back to the asking chat)
-no answer       deny at  5.0 s (the configured cap) — prompt went to telegram:111, not telegram:222
+member_card        [manyhands] This turn's speaker is Minh (member, id telegram:222) …
+stranger           blocked by the invite policy
+member+terminal    "approve" (escalated)   member+recall_open  "block"
+member+web_search  None                   cold session        "block"
+owner+terminal     None                   shared session      guest "block", guest web None
+llm_request mw     member: memory withheld + card injected; owner: untouched
+no gateway         deny in 0.0 s   no answer  deny at 5.0 s   prompt → telegram:111 (owner)
 LIVE INTEGRATION: PASS
 ```
+
+`tests/bench_hooks.py`, 500 iterations per hook on this machine (8 people, 96 facts, 4 shared,
+248 KB SQLite), milliseconds:
+
+```
+pre_llm_call   (identity + policy + audit + context)   p50 0.53   p95 0.71   max 40.79
+pre_tool_call  (turn map + allowlist + audit)          p50 0.15   p95 0.23   max 30.07
+post_api_request (token attribution)                   p50 0.14   p95 0.22   max 107.50
+→ a turn that calls one tool pays ~0.68 ms of manyhands overhead (p50)
+```
+
+The tails are SQLite committing audit rows, not the policy: the decision itself is a pure function
+over a role and a tool name, and costs microseconds.
 
 ## Development
 

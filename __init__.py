@@ -21,7 +21,7 @@ import logging
 from typing import Any
 
 from . import hooks as _hooks
-from . import identity, policy, store
+from . import identity, middleware, policy, store
 from . import tools as _tools
 from .runtime import Runtime
 from .transport import make_transport
@@ -351,8 +351,10 @@ def register(ctx) -> None:
     _runtime = runtime
 
     def _handler(fn):
-        def handle(args: dict[str, Any], session_id: str = "", **kwargs: Any) -> str:
-            return fn(runtime, args if isinstance(args, dict) else {}, session_id)
+        def handle(
+            args: dict[str, Any], session_id: str = "", turn_id: str = "", **kwargs: Any
+        ) -> str:
+            return fn(runtime, args if isinstance(args, dict) else {}, session_id, turn_id)
 
         return handle
 
@@ -383,6 +385,13 @@ def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _hooks.make_pre_tool_call(runtime))
     ctx.register_hook("post_api_request", _hooks.make_post_api_request(runtime))
 
+    # The only public seam that can rewrite the outgoing provider payload: this is what keeps the
+    # operator's own MEMORY.md / USER.md out of a non-owner's system prompt (see middleware.py).
+    try:
+        ctx.register_middleware("llm_request", middleware.make_llm_request_middleware(runtime))
+    except Exception as exc:
+        logger.warning("manyhands: llm_request middleware not registered: %s", exc)
+
     try:
         ctx.register_approval_transport("manyhands", make_transport(runtime))
     except Exception as exc:  # an already-registered transport must not stop the permission hooks
@@ -400,7 +409,7 @@ def register(ctx) -> None:
 
     logger.info(
         "manyhands: 6 tools, pre_llm_call + pre_tool_call + post_api_request hooks, "
-        "approval transport `manyhands`, /many"
+        "llm_request middleware, approval transport `manyhands`, /many"
     )
 
 
@@ -408,8 +417,9 @@ def _describe() -> str:
     """Small helper for the tests and for `hermes plugins` output."""
     return json.dumps(
         {
-            "tools": list(policy.ROLE_TOOLS),
             "roles": list(policy.ROLES),
             "hooks": ["pre_llm_call", "pre_tool_call", "post_api_request"],
+            "middleware": ["llm_request"],
+            "transport": "manyhands",
         }
     )

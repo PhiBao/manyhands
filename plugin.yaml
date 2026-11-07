@@ -48,7 +48,11 @@ config_schema:
     description: "How long the owner's DM approval waits before failing closed."
   approval_tools:
     type: list
-    description: "Tools a non-owner may use only with the owner's approval. Defaults to terminal, execute_code, write_file, patch, browser_exec, delegate_task, cronjob_manage, memory, computer_use, process_manage."
+    description: "Override the per-role ASK bucket with one list for every non-owner. Leave unset: members ask on write/execute/spend, guests never escalate."
+  scope_host_memory:
+    type: bool
+    default: true
+    description: "Withhold the operator's own MEMORY.md / USER.md blocks from a non-owner's system prompt (llm_request middleware)."
   unknown_session_policy:
     type: string
     default: guest

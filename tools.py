@@ -16,13 +16,13 @@ def _ok(**payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _caller(rt, session_id: str) -> dict[str, Any]:
+def _caller(rt, session_id: str, turn_id: str = "") -> dict[str, Any]:
     """Who is calling this tool.
 
     Tool dispatch carries no sender identity, so this resolves the same way ``pre_tool_call`` does:
-    the turn's map, then the persisted session row, then fail closed as an unidentified guest.
+    the turn's map, then the session's, then the database, then fail closed as an unidentified guest.
     """
-    person, _ = rt.person_for_session(session_id or "")
+    person, _ = rt.person_for_session(session_id or "", turn_id or "")
     if person is None:
         return {"person_id": None, "role": policy.GUEST, "tools": [], "display": "unknown session"}
     return person
@@ -35,11 +35,11 @@ def _is_owner(person: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- whoami
 
 
-def whoami(rt, args: dict[str, Any], session_id: str = "") -> str:
+def whoami(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id)
+        person = _caller(rt, session_id, turn_id)
         role = policy.normalize_role(person.get("role"))
-        named = person.get("tools") or policy.ROLE_TOOLS.get(role, [])
+        card = policy.tool_card(role, person.get("tools"))
         pid = person.get("person_id")
         facts = store.count_facts(rt.conn, pid) if pid and pid != identity.OPERATOR else 0
         return _ok(
@@ -47,8 +47,9 @@ def whoami(rt, args: dict[str, Any], session_id: str = "") -> str:
             person_id=pid,
             role=role,
             platform=person.get("platform"),
-            tools=named,
-            tool_count="all" if "*" in (named or []) else len(named or []),
+            allowed=card["allow"],
+            needs_owner_approval=card["ask"],
+            tool_count="all" if "*" in (card["allow"] or []) else len(card["allow"] or []),
             facts=facts,
             paused=rt.paused,
             enforcement=(
@@ -64,10 +65,11 @@ def whoami(rt, args: dict[str, Any], session_id: str = "") -> str:
 # --------------------------------------------------------------------------- people
 
 
-def people(rt, args: dict[str, Any], session_id: str = "") -> str:
+def people(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
         conn = rt.conn
-        caller = _caller(rt, session_id)
+        caller = _caller(rt, session_id, turn_id)
+        viewer_is_owner = _is_owner(caller)
         action = str(args.get("action") or "list").strip().lower()
 
         if action == "list":
@@ -76,20 +78,27 @@ def people(rt, args: dict[str, Any], session_id: str = "") -> str:
                 count=len(rows),
                 people=[
                     {
-                        "person_id": row["person_id"],
+                        # Only the owner sees the platform ids: a roster is a list of people, not a
+                        # directory of accounts for whoever happens to be talking to the bot.
+                        "person_id": row["person_id"] if viewer_is_owner else None,
                         "name": row.get("name") or row.get("display") or row.get("sender_id"),
-                        "platform": row.get("platform"),
+                        "platform": row.get("platform") if viewer_is_owner else None,
                         "role": policy.normalize_role(row.get("role")),
                         "summary": policy.describe_role(row.get("role") or "", row.get("tools")),
                         "facts": store.count_facts(conn, row["person_id"]),
                         "daily_tokens": int(row.get("daily_tokens") or 0),
+                        "you": row["person_id"] == caller.get("person_id"),
                     }
                     for row in rows
                 ],
-                open_invites=len(store.open_invites(conn)),
+                open_invites=len(store.open_invites(conn)) if viewer_is_owner else None,
+                note=None
+                if viewer_is_owner
+                else "platform ids are only shown to the owner; roles and tool counts are public "
+                "inside this chat",
             )
 
-        if not _is_owner(caller):
+        if not viewer_is_owner:
             return _err(
                 "only the owner can change the roster",
                 you=identity.label(caller),
@@ -168,9 +177,9 @@ def people(rt, args: dict[str, Any], session_id: str = "") -> str:
 # --------------------------------------------------------------------------- memory
 
 
-def remember(rt, args: dict[str, Any], session_id: str = "") -> str:
+def remember(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id)
+        person = _caller(rt, session_id, turn_id)
         pid = person.get("person_id")
         text = str(args.get("text") or "").strip()
         if not text:
@@ -188,9 +197,9 @@ def remember(rt, args: dict[str, Any], session_id: str = "") -> str:
         return _err(f"remember failed: {exc.__class__.__name__}: {exc}")
 
 
-def recall(rt, args: dict[str, Any], session_id: str = "") -> str:
+def recall(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id)
+        person = _caller(rt, session_id, turn_id)
         pid = person.get("person_id")
         if not pid or pid == identity.OPERATOR:
             return _ok(results=[], note="no person attached to this conversation")
@@ -219,9 +228,9 @@ def recall(rt, args: dict[str, Any], session_id: str = "") -> str:
         return _err(f"recall failed: {exc.__class__.__name__}: {exc}")
 
 
-def share(rt, args: dict[str, Any], session_id: str = "") -> str:
+def share(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id)
+        person = _caller(rt, session_id, turn_id)
         role = policy.normalize_role(person.get("role"))
         if role not in (policy.OWNER, policy.MEMBER):
             return _err(f"a {role} cannot publish shared facts — ask the owner")
@@ -239,9 +248,9 @@ def share(rt, args: dict[str, Any], session_id: str = "") -> str:
 # --------------------------------------------------------------------------- audit
 
 
-def audit(rt, args: dict[str, Any], session_id: str = "") -> str:
+def audit(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
     try:
-        caller = _caller(rt, session_id)
+        caller = _caller(rt, session_id, turn_id)
         target = str(args.get("person") or "").strip()
         hours = float(args.get("hours") or 24)
         limit = max(1, min(int(args.get("limit") or 25), 100))
