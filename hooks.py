@@ -22,9 +22,10 @@ session, so anything unexpected returns ``None`` (do nothing) rather than an exc
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
-from . import identity, policy, store
+from . import identity, policy, store, transport
 from .runtime import Runtime
 
 
@@ -79,6 +80,11 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     turn_id = str(kwargs.get("turn_id") or "")
     platform = str(kwargs.get("platform") or "")
     sender_id = str(kwargs.get("sender_id") or "")
+    # The platform's own display name, so the owner's approval prompt says "Haruki wants terminal"
+    # instead of an id. Cosmetic only: identity is still decided by (platform, sender_id).
+    sender_name = str(
+        kwargs.get("sender_name") or kwargs.get("user_name") or kwargs.get("display_name") or ""
+    ).strip()
 
     conn = rt.conn
 
@@ -104,6 +110,13 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         invite_role=str(rt.setting("invite_role", "member")),
         user_message=user_message,
     )
+
+    if person is not None and sender_name and not person.get("name"):
+        try:
+            store.set_person_name(conn, person["person_id"], sender_name[:60])
+            person["name"] = sender_name[:60]
+        except Exception:
+            pass
 
     if person is None:
         if refusal is None:
@@ -251,26 +264,131 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         return {"action": "block", "message": decision["message"]}
 
     if needs:
-        # Park the escalation so the approval transport knows who asked and what for. The host's
-        # gate decides how the prompt is presented; if the operator selected the manyhands
-        # transport, the prompt goes to the owner's DM (see transport.py).
-        try:
-            store.add_escalation(
-                rt.conn,
-                tool=tool_name,
+        # The host's action gate (`request_tool_approval` → `_ACTION_GATE`) never consults approval
+        # transports — only the dangerous-command and execute_code gates set `spec.transport`. So a
+        # plugin-level escalation cannot reach the owner through the transport seam, and the prompt
+        # would land in whatever chat asked for the tool. manyhands owns this hop itself:
+        #   1. park the ask under a short code and DM the owner,
+        #   2. block this attempt (nothing runs on silence),
+        #   3. the owner answers `/many approve CODE` in their own chat → one-shot grant,
+        #   4. the asker's next attempt spends the grant and runs exactly once.
+        grant = None if cold else store.live_grant(rt.conn, pid, tool_name)
+        if grant and store.consume_grant(rt.conn, grant["code"]):
+            rt.audit(
+                kind="approval",
                 person_id=pid,
-                summary=f"{who} wants {tool_name}"
-                + (f" {json.dumps(args, ensure_ascii=False)[:160]}" if args else ""),
+                session_id=session_id,
+                turn_id=turn_id,
+                tool=tool_name,
+                needs_approval=True,
+                approved=True,
+                note=f"code {grant['code']} spent — runs once",
             )
-        except Exception:
-            pass
+            return None
+
+        code, delivered, owner_who = _ask_owner(rt, person=person, tool=tool_name, args=args, who=who)
+        if not delivered:
+            rt.audit(
+                kind="refusal",
+                person_id=pid,
+                session_id=session_id,
+                turn_id=turn_id,
+                tool=tool_name,
+                allowed=False,
+                note=f"could not reach the owner ({owner_who or 'nobody on the roster'}) — denied",
+            )
+            return {
+                "action": "block",
+                "message": (
+                    f"I couldn't reach the owner to ask about `{tool_name}`, so I haven't run it. "
+                    "Nothing happened."
+                ),
+            }
         return {
-            "action": "approve",  # the HOST's directive name for "send this to the approval gate"
-            "message": decision["message"],
-            "rule_key": decision.get("rule_key") or tool_name,
+            "action": "block",
+            "message": (
+                f"`{tool_name}` needs the owner's say-so. I've sent {owner_who} a request as code "
+                f"`{code}` — nothing runs until they answer `/many approve {code}` in their own chat. "
+                "Once they approve, ask me again and it will run once."
+            ),
         }
 
     return None
+
+
+def _ask_owner(
+    rt: Runtime, *, person: dict[str, Any], tool: str, args: Any, who: str
+) -> tuple[str, bool, str]:
+    """Park an ask under a short code and send it to the owner's DM.
+
+    Returns ``(code, delivered, owner_label)``. ``delivered`` is False when there is no owner, or
+    the gateway could not carry the DM — both are the caller's cue to fail closed.
+    """
+    owner = identity.pinned_owner(rt.conn)
+    if not owner:
+        return "", False, ""
+    owner_who = identity.label(owner)
+    timeout_s = float(rt.setting("approval_timeout_s", 120) or 120)
+    timeout_s = max(timeout_s, 5.0)
+    try:
+        code = transport.new_code(rt.conn)
+    except Exception:
+        code = ""
+    if not code:
+        return "", False, owner_who
+
+    detail = ""
+    if args:
+        try:
+            detail = json.dumps(args, ensure_ascii=False)[:200]
+        except Exception:
+            detail = ""
+    summary = f"{who} wants {tool}" + (f" {detail}" if detail else "")
+    # One live code per person and tool: a second ask supersedes the first instead of leaving two
+    # prompts with different codes in the owner's chat.
+    try:
+        store.supersede_pending(rt.conn, person.get("person_id"), tool)
+    except Exception:
+        pass
+    store.bind_approval(
+        rt.conn,
+        from_code="",
+        code=code,
+        request_id="",
+        digest="",
+        expires_at=time.time() + timeout_s,
+        tool=tool,
+        person_id=person.get("person_id"),
+        summary=summary,
+    )
+    text = "\n".join(
+        line
+        for line in (
+            f"*Approval needed* — {who}",
+            "",
+            f"`{tool}`" + (f" `{detail}`" if detail else ""),
+            "",
+            f"Reply `/many approve {code}` to allow it once, or `/many deny {code}` to refuse.",
+            f"Nothing runs if nobody answers within {int(timeout_s)}s.",
+        )
+        if line is not None
+    )
+    delivered = rt.dm(owner, text)
+    rt.audit(
+        kind="approval",
+        person_id=person.get("person_id"),
+        tool=tool,
+        needs_approval=True,
+        approved=None,
+        note=f"code {code} -> owner DM ({'delivered' if delivered else 'DELIVERY FAILED'})",
+    )
+    if not delivered:
+        # Nobody has the code, so it must not be spendable and must not sit in "waiting on you".
+        try:
+            store.expire_approval(rt.conn, code)
+        except Exception:
+            pass
+    return code, bool(delivered), owner_who
 
 
 def make_pre_tool_call(rt: Runtime):

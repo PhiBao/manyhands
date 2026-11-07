@@ -84,22 +84,56 @@ Then, once:
    requires local access to the machine — a stranger in the group cannot make themselves owner.
 2. **Invite everybody else.** `/many invite member` mints a single-use code. They reply
    `join <code>` in the chat. Nobody self-registers silently.
-3. **Route approvals to your DM** (optional but this is the point):
+3. **Let the plugin reach your DM** — one setting, because a notification needs the gateway:
    ```yaml
-   security:
-     approval:
-       transport: manyhands
-       transport_fallback: builtin   # keep the stock prompt for your OWN local/desktop sessions
    plugins:
      entries:
        manyhands:
-         allow_gateway_injection: true    # the DM channel
+         allow_gateway_injection: true
    ```
 
-Without step 3 the roles and memory still work; approval prompts then go to the host's own surface
-instead of your DM. **Set `transport_fallback: builtin` if you also work from the CLI or the desktop
-app**: a selected transport replaces *every* approval surface, and with no gateway running there is
-nobody to DM, so the honest answer is a deny — the fallback keeps your own approvals where they were.
+That is all a role-gated tool needs. manyhands parks the ask itself: it mints a 4-character code,
+sends *you* the prompt in your own DM, and **blocks the call** — nothing runs on silence. You answer
+`/many approve CODE` in your own chat and the asker's next attempt runs exactly once.
+
+### Why the plugin owns that hop
+
+Hermes ships an approval-transport seam, and manyhands registers one (`transport: manyhands` is
+still useful — see below), but the seam does not cover plugin escalations. In
+`tools/approval.py` the gate a plugin escalation goes through is:
+
+```python
+_ACTION_GATE = _GateSpec(noun="action", transport=False, ...)
+# "Plugin-escalated tool calls / protected writes: no transport…"
+```
+
+Only the dangerous-command and `execute_code` gates set `spec.transport=True`. So a
+`pre_tool_call` escalation never reaches a registered transport, and a prompt left to the host's
+built-in surface appears in whichever chat asked for the tool — the exact thing this plugin exists to
+prevent. Verified against `hermes-agent` at the pinned commit, live, on a two-account bot.
+
+**What the transport is still for:** dangerous shell commands. If a person *may* use `terminal` and
+the command trips one of Hermes' own Tier-2 patterns, that gate does consult transports, so:
+
+```yaml
+security:
+  approval:
+    transport: manyhands
+    transport_fallback: builtin   # keep the stock prompt for your OWN local/desktop sessions
+```
+
+**Set `transport_fallback: builtin` if you also work from the CLI or the desktop app**: a selected
+transport replaces *every* approval surface, and with no gateway running there is nobody to DM, so
+the honest answer is a deny — the fallback keeps your own approvals where they were.
+
+## Known host behaviour
+
+A plugin-triggered message reaches the gateway through
+`PluginContext.inject_message` → `PluginManager.inject_gateway_message`, whose docstring is
+*"Submit a plugin-triggered turn to the live gateway."* An approval prompt is therefore a **turn** in
+your own conversation, not a side channel: it costs one model call in the owner's chat, and the agent
+sees it as context on its next turn. Keep `approval_timeout_s` honest (the default 120 s) so a stale
+prompt cannot sit in the chat for long, and read the code off `/many pending` if the chat scrolled.
 
 ## The safety contract
 
@@ -116,7 +150,15 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
 4. **Refusals are polite, specific and non-disclosing.** A blocked tool returns a plain-language
    message naming the person's own role and never what somebody else has access to. The roster hides
    platform ids from non-owners (`test_the_roster_hides_platform_ids_from_non_owners`).
-5. **Nothing is silent.** Every turn, tool decision, refusal, approval and token count is an audit
+5. **An approval is one shot, for one person, for one tool.** `/many approve CODE` opens a
+   `consumed_at IS NULL` grant bound to that person and that tool; the next call spends it and the
+   call after that asks again (`test_owner_approval_unlocks_exactly_one_retry`,
+   `test_a_grant_is_bound_to_the_person_and_the_tool`).
+6. **An expired code is not consent.** A code past its deadline is not listed as pending and cannot be
+   approved, even if nothing swept the row (`test_an_expired_code_can_never_be_approved`).
+7. **A second ask supersedes the first.** One live code per person and tool, so the owner's chat never
+   shows two prompts that disagree (`test_a_second_ask_supersedes_the_first_code`).
+8. **Nothing is silent.** Every turn, tool decision, refusal, approval and token count is an audit
    row; `/many audit` shows them.
 6. **The owner can always act**, and can switch enforcement off with `/many pause` — which writes a
    loud audit row instead of quietly forgetting, and still tells the model who it is talking to.
@@ -187,7 +229,8 @@ audit         ts, person_id, session_id, turn_id, kind (turn|tool|refusal|approv
               tool, allowed, needs_approval, approved, tokens, note
 sessions      session_id → person_id (survives a restart)
 invites       single-use codes with the role they grant
-approvals     code, person_id, tool, summary, request_id, digest, status, decided_by, choice, expires_at
+approvals     code, person_id, tool, summary, request_id, digest, status, decided_by, choice,
+              expires_at, consumed_at   -- consumed_at NULL = a grant still waiting to be spent
 settings      key/value (pause flag, pinned owner, db path)
 ```
 

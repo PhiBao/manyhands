@@ -186,19 +186,117 @@ class ToolPermissions(unittest.TestCase):
         allowed = hook(tool_name="web_search", args={}, session_id="g1", turn_id="t2")
         self.assertIsNone(allowed)
 
-    def test_member_gets_an_approval_prompt_for_a_sensitive_tool(self):
+    def test_member_asking_for_shell_parks_a_code_in_the_owner_dm(self):
         rt = new_runtime()
         seed_roster(rt)
         # no grant, no configuration: asking for a shell command is what a member gets escalated for
         turn(rt, sender="222", session="m1")
         result = hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "rm -rf build"},
                                              session_id="m1", turn_id="t1")
-        self.assertEqual(result.get("action"), "approve")
-        self.assertEqual(result.get("rule_key"), "terminal")
-        # the escalation is parked so the transport can name the asker
-        parked = store.match_escalation(rt.conn, "terminal")
-        self.assertIsNotNone(parked)
-        self.assertEqual(parked["person_id"], "telegram:222")
+        self.assertEqual(result.get("action"), "block", "the ask is parked, not approved")
+        self.assertIn("/many approve", result.get("message", ""))
+        # the prompt went to the owner's DM and named the person who asked
+        self.assertEqual(len(rt.ctx.injected), 1)
+        self.assertEqual(rt.ctx.injected[0]["origin"]["chat_id"], "111")
+        self.assertIn("Minh", rt.ctx.injected[0]["content"])
+        pending = store.pending_approvals(rt.conn)
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["person_id"], "telegram:222")
+        self.assertEqual(pending[0]["tool"], "terminal")
+        self.assertIn(pending[0]["code"], result.get("message", ""))
+
+    def test_owner_approval_unlocks_exactly_one_retry(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="g1")
+        tool_hook = hooks.make_pre_tool_call(rt)
+        first = tool_hook(tool_name="terminal", args={"command": "npm test"}, session_id="g1", turn_id="t1")
+        self.assertEqual(first.get("action"), "block")
+        code = store.pending_approvals(rt.conn)[0]["code"]
+        # the owner types /many approve CODE in their own chat
+        self.assertTrue(store.decide_approval(rt.conn, code, True, "Kiter", choice="once"))
+        # the asker's next attempt spends the grant and runs…
+        self.assertIsNone(tool_hook(tool_name="terminal", args={"command": "npm test"}, session_id="g1", turn_id="t2"))
+        # …and only once: the third attempt is parked again
+        third = tool_hook(tool_name="terminal", args={"command": "npm test"}, session_id="g1", turn_id="t3")
+        self.assertEqual(third.get("action"), "block")
+
+    def test_an_expired_code_can_never_be_approved(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="e1")
+        hooks.make_pre_tool_call(rt)(tool_name="terminal", args={}, session_id="e1", turn_id="t1")
+        code = store.pending_approvals(rt.conn)[0]["code"]
+        # the clock runs out — no sweeper has touched the row, only the deadline has passed
+        rt.conn.execute("UPDATE approvals SET expires_at = ? WHERE code = ?", (time.time() - 1, code))
+        rt.conn.commit()
+        self.assertEqual(store.pending_approvals(rt.conn), [], "an expired code is not pending")
+        self.assertFalse(
+            store.decide_approval(rt.conn, code, True, "Kiter", choice="once"),
+            "silence past the deadline is not consent",
+        )
+        self.assertIsNone(store.live_grant(rt.conn, "telegram:222", "terminal"))
+
+    def test_a_second_ask_supersedes_the_first_code(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="s1")
+        tool_hook = hooks.make_pre_tool_call(rt)
+        first = tool_hook(tool_name="terminal", args={}, session_id="s1", turn_id="t1")
+        code1 = store.pending_approvals(rt.conn)[0]["code"]
+        second = tool_hook(tool_name="terminal", args={}, session_id="s1", turn_id="t2")
+        code2 = store.pending_approvals(rt.conn)[0]["code"]
+        self.assertNotEqual(code1, code2)
+        self.assertEqual(len(store.pending_approvals(rt.conn)), 1, "only one code is ever live")
+        self.assertIn(code2, second.get("message", ""))
+        # the superseded code cannot be spent
+        self.assertFalse(store.decide_approval(rt.conn, code1, True, "Kiter", choice="once"))
+
+    def test_a_grant_is_bound_to_the_person_and_the_tool(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="b1")
+        tool_hook = hooks.make_pre_tool_call(rt)
+        tool_hook(tool_name="terminal", args={}, session_id="b1", turn_id="t1")
+        code = store.pending_approvals(rt.conn)[0]["code"]
+        store.decide_approval(rt.conn, code, True, "Kiter", choice="once")
+        # the guest in the same house does not inherit the member's approval
+        turn(rt, sender="333", session="b1-guest")
+        guest = tool_hook(tool_name="terminal", args={}, session_id="b1-guest", turn_id="t2")
+        self.assertEqual(guest.get("action"), "block")
+        # and the same person asking for a DIFFERENT tool does not inherit it either
+        turn(rt, sender="222", session="b2")
+        other = tool_hook(tool_name="recall_open", args={}, session_id="b2", turn_id="t3")
+        self.assertEqual(other.get("action"), "block")
+
+    def test_an_ask_with_no_owner_dm_available_fails_closed(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        rt.ctx.inject_message = lambda *a, **k: False  # the gateway cannot carry the DM
+        turn(rt, sender="222", session="n1")
+        result = hooks.make_pre_tool_call(rt)(tool_name="terminal", args={}, session_id="n1", turn_id="t1")
+        self.assertEqual(result.get("action"), "block")
+        self.assertIn("couldn't reach the owner", result.get("message", ""))
+        self.assertEqual(store.pending_approvals(rt.conn), [], "nothing is left waiting on a prompt nobody got")
+        refusals = [r for r in store.audit_rows(rt.conn, hours=1) if r["kind"] == "refusal"]
+        self.assertTrue(any("could not reach the owner" in (r.get("note") or "") for r in refusals))
+
+    def test_the_platform_display_name_fills_a_blank_name_only(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        # an invited person arrives with no name on the roster
+        store.add_person(rt.conn, platform="telegram", sender_id="444", role="guest", name=None)
+        hooks.make_pre_llm_call(rt)(
+            user_message="hi", session_id="n1", turn_id="t1", platform="telegram",
+            sender_id="444", sender_name="Zara K",
+        )
+        self.assertEqual(store.get_person(rt.conn, "telegram:444")["name"], "Zara K")
+        # a name the operator already set is never overwritten by the platform's
+        hooks.make_pre_llm_call(rt)(
+            user_message="hi", session_id="n2", turn_id="t2", platform="telegram",
+            sender_id="222", sender_name="Some Other Name",
+        )
+        self.assertEqual(store.get_person(rt.conn, "telegram:222")["name"], "Minh")
 
     def test_owner_is_never_blocked(self):
         rt = new_runtime()
@@ -298,7 +396,9 @@ class Approvals(unittest.TestCase):
         rt = new_runtime({"approval_timeout_s": 2})
         seed_roster(rt)
         turn(rt, sender="222", session="m3")
-        hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "rm -rf build"}, session_id="m3")
+        # the dangerous-command gate parks this the same way the hook does before it prompts
+        store.add_escalation(rt.conn, tool="terminal", person_id="telegram:222",
+                             summary="Minh wants terminal {\"command\": \"rm -rf build\"}")
         present = transport.make_transport(rt)
         started = time.time()
         decision = present(self._request())
@@ -319,7 +419,8 @@ class Approvals(unittest.TestCase):
         rt = new_runtime({"approval_timeout_s": 6})
         seed_roster(rt)
         turn(rt, sender="222", session="m4")
-        hooks.make_pre_tool_call(rt)(tool_name="terminal", args={"command": "npm test"}, session_id="m4")
+        store.add_escalation(rt.conn, tool="terminal", person_id="telegram:222",
+                             summary="Minh wants terminal {\"command\": \"npm test\"}")
 
         # the owner types /many approve CODE while the transport is waiting
         import threading
@@ -500,9 +601,10 @@ class SharedSession(unittest.TestCase):
         blocked = tool_hook(tool_name="terminal", args={}, session_id=shared, turn_id="turn-g")
         self.assertEqual(blocked.get("action"), "block")
         self.assertIn("guest", blocked.get("message", ""))
-        # the member's dangerous tool is escalated, not blocked: the three-state model
+        # the member's dangerous tool is escalated to the owner under a code, not refused
         escalated = tool_hook(tool_name="terminal", args={}, session_id=shared, turn_id="turn-m")
-        self.assertEqual(escalated.get("action"), "approve")
+        self.assertEqual(escalated.get("action"), "block")
+        self.assertIn("/many approve", escalated.get("message", ""))
 
 
 class ThreeStates(unittest.TestCase):

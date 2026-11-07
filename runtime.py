@@ -7,12 +7,16 @@ not — see README §Why the map exists).
 
 from __future__ import annotations
 
+import logging
+
 import os
 import threading
 from pathlib import Path
 from typing import Any
 
 from . import identity, store
+
+logger = logging.getLogger("hermes_plugins.manyhands")
 
 DEFAULTS: dict[str, Any] = {
     # Unknown senders: "invite" (fail closed until a code is redeemed), "open" (guest), "closed".
@@ -182,6 +186,7 @@ class Runtime:
                 self.ctx.inject_message(str(text), role="assistant", origin=origin)
             )
         except Exception:
+            logger.exception("manyhands: inject_message failed for %s", origin.get("chat_id"))
             return False
 
     def dm_owner(self, text: str) -> tuple[bool, dict[str, Any] | None]:

@@ -122,7 +122,31 @@ def directive(tool, args, session, turn="turn-1"):
     )[0]
 
 
-out["member_terminal"] = directive("terminal", {"command": "rm -rf build"}, "sess-minh")
+# a member asking for a shell command is parked under a code the owner has to answer
+_member_ask = P.get_pre_tool_call_directive(
+    "terminal", {"command": "rm -rf build"}, task_id="t1", session_id="sess-minh",
+    tool_call_id="tc", turn_id="turn-1",
+)
+out["member_terminal"], out["member_terminal_message"] = _member_ask[0], _member_ask[1] or ""
+
+# 1b — the owner answers /many approve CODE, the retry spends the grant, the third ask is parked.
+# The probe has no live gateway, so the hook's own DM cannot be delivered (it fails closed above).
+# So this opens the REAL plugin database the way the hook does and stands in for the owner's DM +
+# `/many approve CODE`, then drives the real host directive path again.
+try:
+    import importlib
+    _store = importlib.import_module("hermes_plugins.manyhands.store")
+    _conn = _store.connect(Path(os.environ["HERMES_HOME"]) / "plugin-data" / "manyhands" / "manyhands.db")
+    _code = "TST1"
+    _store.bind_approval(_conn, from_code="", code=_code, request_id="", digest="",
+                         expires_at=__import__("time").time() + 120, tool="terminal",
+                         person_id="telegram:222", summary="Minh wants terminal")
+    out["owner_approve_ok"] = _store.decide_approval(_conn, _code, True, "Kiter", choice="once")
+    out["retry_after_approval"] = directive("terminal", {"command": "rm -rf build"}, "sess-minh", turn="turn-1b")
+    out["third_ask_parked"] = directive("terminal", {"command": "rm -rf build"}, "sess-minh", turn="turn-1c")
+except Exception as exc:  # noqa: BLE001
+    out["owner_approve_ok"] = f"error: {exc}"
+
 # a member's dangerous tool escalates to the owner instead of being refused...
 out["member_recall"] = directive("recall_open", {"path": "/etc/passwd"}, "sess-minh")
 out["member_web_search"] = directive("web_search", {"query": "x"}, "sess-minh", turn="turn-1")
@@ -221,7 +245,13 @@ print("\naudit:", store.audit_summary(rt.conn, hours=1))
 ok = (
     out["member_card_injected"]
     and out["stranger_blocked"]
-    and out["member_terminal"] == "approve"   # three-state: a member ASKS, it is not a "no"
+    and out["member_terminal"] == "block"     # three-state: a member ASKS, and the ask is parked
+    # no live gateway in the probe, so the ask fails closed instead of parking a code (both are
+    # "block"); the parked-code wording is covered by tests/selftest.py where the DM is recordable
+    and "owner" in out["member_terminal_message"]
+    and out.get("owner_approve_ok") is True    # the owner's /many approve landed
+    and out.get("retry_after_approval") is None            # the retry runs, once…
+    and out.get("third_ask_parked") == "block"             # …and only once
     and out["member_recall"] == "block"       # a tool nobody granted is still a plain no
     and out["member_web_search"] is None
     and out["cold_session_terminal"] == "block"

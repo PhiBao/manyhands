@@ -90,7 +90,13 @@ def person_card(rt, person: dict[str, Any]) -> str:
         f"{CARD_MARKER} This conversation belongs to {who} ({role}, id {person.get('person_id')}).",
         f"Tools that run without asking the owner: {allow}.",
         f"Tools that need the owner's approval first: {ask}.",
-        "Do not offer a tool outside those buckets, and never describe what anybody else has access to.",
+        (
+            "Calling one of those is the right move when they ask for it: the call is parked under a "
+            "code, the owner is messaged in their own DM, and nothing runs until they answer. Do "
+            "not tell them a tool is unavailable — offer to ask."
+            if card["ask"]
+            else "Do not offer a tool outside those buckets, and never describe what anybody else has access to."
+        ),
     ]
     try:
         facts = rt.conn.execute(

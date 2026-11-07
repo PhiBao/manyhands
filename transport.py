@@ -23,6 +23,7 @@ Fail-closed rules (all tested):
 
 from __future__ import annotations
 
+import logging
 import random
 import time
 from typing import Any, Callable
@@ -35,6 +36,8 @@ CODE_ALPHABET = "ACDEFGHJKMNPQRSTUVWXYZ23456789"
 _RANDOM = random.SystemRandom()
 
 POLL_INTERVAL_S = 0.5
+
+logger = logging.getLogger("hermes_plugins.manyhands")
 
 
 def new_code(conn, length: int = 4) -> str:
@@ -92,7 +95,7 @@ def _present(rt, request: Any) -> Any:
     timeout_s = max(timeout_s, 5.0)
 
     tool = str(getattr(request, "pattern_key", "") or "command")
-    escalation = store.match_escalation(conn, tool)
+    escalation = store.match_escalation(conn, tool) or store.recent_asker(conn, tool)
     person_id = escalation.get("person_id") if escalation else None
     who = "the machine" if not person_id else identity.label(store.get_person(conn, person_id))
     summary = (escalation or {}).get("summary") or str(getattr(request, "description", "") or tool)
@@ -123,7 +126,13 @@ def _present(rt, request: Any) -> Any:
     )
 
     text = prompt_text(request, who=who, code=code, timeout_s=timeout_s)
+    logger.info(
+        "manyhands: approval %s for %s -> prompting owner %s under code %s",
+        tool, who, owner.get("person_id"), code,
+    )
     delivered = rt.dm(owner, text)
+    if not delivered:
+        logger.warning("manyhands: owner DM for code %s could not be delivered", code)
     rt.audit(
         kind="approval",
         person_id=person_id,
@@ -180,7 +189,18 @@ def make_transport(rt) -> Callable[[Any], Any]:
     def present(request: Any) -> Any:
         try:
             return _present(rt, request)
-        except Exception:
+        except Exception as exc:  # noqa: BLE001 - a transport bug must never authorize, but it must be visible
+            logger.exception("manyhands: approval transport failed for %r", getattr(request, "pattern_key", ""))
+            try:
+                rt.audit(
+                    kind="approval",
+                    tool=str(getattr(request, "pattern_key", "") or ""),
+                    needs_approval=True,
+                    approved=False,
+                    note=f"transport error: {type(exc).__name__}: {exc}"[:300],
+                )
+            except Exception:
+                pass
             # Never let a transport bug authorize anything.
             try:
                 return request.respond("deny")

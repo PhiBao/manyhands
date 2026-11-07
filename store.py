@@ -117,13 +117,19 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
 """
 
 #: Bump when a column is added; ``migrate()`` applies ``COLUMN_ADDITIONS`` idempotently.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+
+#: How long an approved-but-unspent grant stays live, so the asker has time to retry the tool.
+GRANT_TTL_S = 900.0
 
 #: ``(table, column, ddl)`` — every upgrade this plugin has ever needed, applied once each.
 COLUMN_ADDITIONS: tuple[tuple[str, str, str], ...] = (
     ("approvals", "choice", "TEXT"),
     ("approvals", "summary", "TEXT"),
     ("audit", "turn_id", "TEXT"),
+    # A pending approval the owner grants becomes a one-shot grant; ``consumed_at`` is when the
+    # asker spent it. NULL means the grant is still unspent.
+    ("approvals", "consumed_at", "REAL"),
 )
 
 
@@ -260,6 +266,16 @@ def touch_person(conn: sqlite3.Connection, person_id: str, display: str | None =
         (now(), display, person_id),
     )
     conn.commit()
+
+
+def set_person_name(conn: sqlite3.Connection, person_id: str, name: str) -> bool:
+    """Record the platform display name the first time we see it (used in prompts and the roster)."""
+    cur = conn.execute(
+        "UPDATE people SET name = ? WHERE person_id = ? AND (name IS NULL OR name = '')",
+        (str(name), str(person_id)),
+    )
+    conn.commit()
+    return cur.rowcount == 1
 
 
 def set_role(conn: sqlite3.Connection, person_id: str, role: str) -> bool:
@@ -517,6 +533,24 @@ def match_escalation(conn: sqlite3.Connection, tool: str, window_s: float = 180.
     return dict(row) if row else None
 
 
+def recent_asker(
+    conn: sqlite3.Connection, tool: str, window_s: float = 300.0
+) -> dict[str, Any] | None:
+    """The newest row naming who asked for *tool*, whatever its status.
+
+    The dangerous-command gate fires *after* a plugin approval is spent, so by then the escalation
+    row is already ``approved``/``used``. Falling back to the newest row for the same tool keeps the
+    owner's prompt naming the person who asked instead of "the machine".
+    """
+    row = conn.execute(
+        """SELECT * FROM approvals
+           WHERE tool = ? AND person_id IS NOT NULL AND created_at >= ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (str(tool), now() - float(window_s)),
+    ).fetchone()
+    return dict(row) if row else None
+
+
 def bind_approval(
     conn: sqlite3.Connection,
     *,
@@ -570,10 +604,22 @@ def decision_for(conn: sqlite3.Connection, code: str) -> dict[str, Any] | None:
 def decide_approval(
     conn: sqlite3.Connection, code: str, approved: bool, decided_by: str, choice: str = ""
 ) -> bool:
+    # An approval is not a prompt any more: it becomes a one-shot grant with its own window, so the
+    # asker can retry after the owner answers without the row expiring in the meantime.
     cur = conn.execute(
-        """UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, choice = ?
-           WHERE code = ? AND status = 'pending'""",
-        ("approved" if approved else "denied", decided_by, now(), choice, code.upper()),
+        """UPDATE approvals SET status = ?, decided_by = ?, decided_at = ?, choice = ?,
+                               expires_at = CASE WHEN ? = 'approved' THEN ? ELSE expires_at END
+           WHERE code = ? AND status = 'pending' AND expires_at > ?""",
+        (
+            "approved" if approved else "denied",
+            decided_by,
+            now(),
+            choice,
+            "approved" if approved else "denied",
+            now() + GRANT_TTL_S,
+            code.upper(),
+            now(),
+        ),
     )
     conn.commit()
     return cur.rowcount == 1
@@ -588,10 +634,56 @@ def expire_approval(conn: sqlite3.Connection, code: str) -> None:
 
 
 def pending_approvals(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Codes still waiting on the owner — expired ones are not pending, even before anyone sweeps them."""
     rows = conn.execute(
-        "SELECT * FROM approvals WHERE status = 'pending' ORDER BY created_at DESC"
+        """SELECT * FROM approvals
+           WHERE status = 'pending' AND expires_at > ?
+           ORDER BY created_at DESC""",
+        (now(),),
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def supersede_pending(conn: sqlite3.Connection, person_id: str | None, tool: str) -> int:
+    """Close any older open ask for the same person and tool, so exactly one code is ever live."""
+    cur = conn.execute(
+        """UPDATE approvals SET status = 'expired', decided_at = ?
+           WHERE status = 'pending' AND tool = ? AND IFNULL(person_id, '') = IFNULL(?, '')""",
+        (now(), str(tool), person_id),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def live_grant(
+    conn: sqlite3.Connection, person_id: str | None, tool: str
+) -> dict[str, Any] | None:
+    """The newest approval *person* got for *tool* that is approved, unspent, and not expired.
+
+    The host's action gate never consults plugin transports, so the owner's "yes" is stored as a
+    one-shot grant and spent by the asker's next attempt at the same tool. A grant is bound to the
+    person and the tool: approving one person's `terminal` never unlocks somebody else's.
+    """
+    if not person_id:
+        return None
+    row = conn.execute(
+        """SELECT * FROM approvals
+           WHERE person_id = ? AND tool = ? AND status = 'approved'
+             AND consumed_at IS NULL AND expires_at > ?
+           ORDER BY created_at DESC LIMIT 1""",
+        (str(person_id), str(tool), now()),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def consume_grant(conn: sqlite3.Connection, code: str) -> bool:
+    """Spend a grant, so the same approval can never run a tool twice."""
+    cur = conn.execute(
+        "UPDATE approvals SET consumed_at = ? WHERE code = ? AND consumed_at IS NULL",
+        (now(), str(code).upper()),
+    )
+    conn.commit()
+    return cur.rowcount == 1
 
 
 # --------------------------------------------------------------------------- audit
