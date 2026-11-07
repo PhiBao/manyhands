@@ -19,7 +19,8 @@ the plugin that acts on it.
   (everything else) `never`. A member who asks for a shell command does not get "no" — they get the
   owner's phone lighting up. A guest never escalates: prompting the owner on a stranger's behalf is
   a phishing surface, not a feature. Roles are `owner`, `member`, `guest`, `blocked`.
-- **Approvals** for anything sensitive go to the **owner's DM**, not to whoever is in the room.
+- **Approvals** for anything sensitive are parked under a short code that goes to the **owner's DM**,
+  not to whoever is in the room; the owner's `/many approve CODE` unlocks exactly one run.
 - **Memory** is per person — and the operator's own `MEMORY.md`/`USER.md` is **withheld** from
   everybody else's system prompt, because "everyone gets their own Hermes" has to include not
   handing a stranger your notes.
@@ -28,6 +29,8 @@ the plugin that acts on it.
 Nothing leaves the machine. No network calls, no third-party dependencies, standard library only.
 
 ---
+
+![a guest refused, a member parked, the owner's DM](docs/approval.png)
 
 ## The gap it fills (measured, not assumed)
 
@@ -67,7 +70,7 @@ conversation does not exist in the marketplace.**
 | hook | `pre_tool_call` | three-state allow/ask/never per role; escalate to approval; **fail closed** on unknown sessions |
 | hook | `post_api_request` | attribute token usage to whoever owns the turn |
 | middleware | `llm_request` | withhold the operator's own MEMORY/USER blocks from a non-owner's system prompt, and put the person card where it belongs (the system prompt) |
-| transport | `manyhands` | present approval prompts in the **owner's DM** under a short code |
+| transport | `manyhands` | dangerous-command prompts to the **owner's DM** under a short code (plugin escalations are parked and DM'd by the hook itself) |
 | command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve <code> · deny <code>` |
 
 ## Install
@@ -193,13 +196,14 @@ would be attributed to whoever spoke last, and one person's tool call would be j
 other's role. When the turn map, the session map and the database all come up empty, the call fails
 closed.
 
-**The approval transport does not know who asked.** It receives a redacted `ApprovalRequest`
-(`hermes_cli/approval_transport.py`) — command, description, pattern_key, timeout, allowed choices —
-and nothing about the person. `pre_tool_call` therefore parks the escalation (who, which tool) in the
-`approvals` table; the transport binds the host's `request_id`/`digest` onto the newest unclaimed
-escalation for that tool and turns it into a prompt with a short code. Requests that did not come
-from manyhands (a stock dangerous-command prompt) are still routed to the owner's DM, they just
-cannot name the asker.
+**The host's approval transport does not know who asked, and a plugin escalation never reaches it.**
+A transport receives a redacted `ApprovalRequest` (`hermes_cli/approval_transport.py`) — command,
+description, pattern_key, timeout, allowed choices — and nothing about the person. Worse, the gate a
+plugin escalation goes through is `_ACTION_GATE`, built with `transport=False`, so
+`ctx.register_approval_transport` is never called for it. manyhands therefore owns that hop: the hook
+parks the ask (who, which tool) in the `approvals` table under a short code and DMs the owner itself.
+The transport stays registered for the prompts that *do* consult it — a dangerous shell command a
+person is allowed to run — and names the asker from the newest parked row for that tool.
 
 **A hook cannot touch the system prompt, but middleware can.** `pre_llm_call` only appends to the
 *user* message, which is where the operator's own `MEMORY.md`/`USER.md` blocks would sail past it into
@@ -208,8 +212,8 @@ a guest's context. `ctx.register_middleware("llm_request", cb)` receives the ful
 model. That is the seam this plugin uses to withhold the operator's memory from everybody else and to
 put the person card in the system prompt where it belongs. It is deliberately **fail-open** (any
 surprise ⇒ leave the request alone): it is a privacy filter, and `pre_tool_call` is what stops a tool.
-The plugin manifest has no `provides_middleware` field, so the capability is declared in the catalog
-entry instead.
+The capability is declared in `plugin.yaml` as `provides_middleware: [llm_request]` — the manifest
+parser warns `unknown field` about it while the validator **fails** without it. Declaring it wins.
 
 **Return values are directives, not booleans.** `pre_llm_call` accepts `{"context": …}` (appended to
 the user message) or `{"action": "block", "message": …}` (turn ends, no inference). `pre_tool_call`
@@ -274,7 +278,7 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 41 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 47 tests, stdlib unittest, no Hermes install
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
 hermes plugins validate ./                                   # the catalog CI gate
@@ -282,7 +286,8 @@ hermes plugins validate ./                                   # the catalog CI ga
 
 `tests/selftest.py` drives the plugin with stub contexts and covers, among others: unknown sender
 refused under `closed`; invite admitted once and only once; identity never taken from message text;
-a guest refused with a role-naming message; a member's dangerous tool escalated rather than refused;
+a guest refused with a role-naming message; a member's dangerous tool parked under an owner code rather than refused; the owner's
+approval unlocking exactly one retry; an expired code refused; a second ask superseding the first;
 an explicit grant beating the ask bucket; a member unable to reach the operator's files; the roster
 hiding platform ids from non-owners; two people in one shared session never confused; a cold session
 blocked; the session map surviving a restart; an old database upgraded in place; the approval prompt
