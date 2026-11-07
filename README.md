@@ -73,6 +73,8 @@ conversation does not exist in the marketplace.**
 | transport | `manyhands` | dangerous-command prompts to the **owner's DM** under a short code (plugin escalations are parked and DM'd by the hook itself) |
 | command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve <code> · deny <code>` |
 
+Tested on **Hermes Agent v0.23.0** (`2bd378ed`), Linux.
+
 ## Install
 
 ```bash

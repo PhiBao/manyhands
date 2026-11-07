@@ -13,7 +13,7 @@ author: PhiBao
 license: MIT
 homepage: https://github.com/PhiBao/manyhands
 tags: [multi-user, permissions, roles, approvals, memory, identity, household, team]
-requires_hermes: ">=0.19"
+requires_hermes: ">=0.23.0"
 provides_tools:
   - manyhands_whoami
   - manyhands_people
