@@ -1,5 +1,5 @@
 name: manyhands
-version: 0.3.0
+version: 0.3.1
 manifest_version: 2
 api_version: 1
 description: >-
@@ -61,6 +61,14 @@ config_schema:
     type: string
     default: guest
     description: "A session with no human turn on it (restart, subagent, socket): guest fails closed, operator trusts the host."
+  local_seat_policy:
+    type: string
+    default: operator
+    description: "The operator's own terminal (platform cli/local with this machine's attested uid): operator is the host's own seat, roster makes it join like any other sender."
+  db_path:
+    type: string
+    default: ""
+    description: "Where the plugin's SQLite file lives. Empty = the host's plugin-data/manyhands/ directory. Set it in config.yaml, not .env."
   paused:
     type: bool
     default: false

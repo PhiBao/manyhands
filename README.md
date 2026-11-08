@@ -131,7 +131,38 @@ security:
 transport replaces *every* approval surface, and with no gateway running there is nobody to DM, so
 the honest answer is a deny — the fallback keeps your own approvals where they were.
 
+## Settings
+
+All of these live in `config.yaml` under `plugins.entries.manyhands.settings`, and every one has a
+`config_schema` entry, so `hermes plugins config manyhands` validates them. Behaviour belongs in
+`config.yaml`; `.env` is for secrets and this plugin has none.
+
+| key | default | what it does |
+|---|---|---|
+| `unknown_sender_policy` | `invite` | `invite` refuses until a code is redeemed, `open` auto-guests, `closed` refuses outright |
+| `invite_role` | `member` | the role a redeemed invite grants |
+| `unknown_session_policy` | `guest` | a session with no human turn on it: `guest` fails closed, `operator` trusts every caller with no identity |
+| `local_seat_policy` | `operator` | the operator's own terminal (`platform=cli` + this machine's attested `uid:<uid>`): `operator` is the host's own seat, `roster` makes it join like any other sender |
+| `db_path` | *(empty)* | where the SQLite file lives; empty = the host's `plugin-data/manyhands/`. Set it here, not in `.env` |
+| `approval_timeout_s` | `120` | how long the owner's DM waits before the ask is denied |
+| `approval_tools` | *(unset)* | replace the per-role ASK bucket with one list; leave unset so guests never escalate |
+| `max_person_facts` | `8` | how many of a person's own facts go into their turn |
+| `max_shared_facts` | `5` | how many shared facts go into every turn |
+| `scope_host_memory` | `true` | withhold the operator's `MEMORY`/`USER` blocks from non-owners (the `llm_request` middleware) |
+| `paused` | `false` | the persisted default for `/many pause` |
+
+`MANYHANDS_DB` is still read as an escape hatch by the stdlib test scripts and one-off migrations,
+and a configured `db_path` always wins over it.
+
 ## Known host behaviour
+
+**A tool called from inside another tool has no identity on it.** `execute_code`'s kernel calls
+`hermes_tools.terminal(...)` through a path that hands `pre_tool_call` an empty `session_id` and an
+empty `turn_id` (observed live: the audit row for the nested call carries `session_id = ''`), so
+there is nothing to attribute it to and the plugin fails closed at the guest allowlist. The refusal
+says exactly that rather than claiming a guest asked. Anything you want a *person* to be able to do
+should be asked for in a chat turn, not from inside `execute_code`; the owner can set
+`unknown_session_policy: operator` to stop failing closed on those calls.
 
 A plugin-triggered message reaches the gateway through
 `PluginContext.inject_message` → `PluginManager.inject_gateway_message`, whose docstring is
@@ -145,10 +176,14 @@ prompt cannot sit in the chat for long, and read the code off `/many pending` if
 These are rules, not intentions. Each one has a test that fails if it stops being true.
 
 1. **Identity comes from the platform event, never from message text.** A message saying "I'm the
-   owner" changes nothing (`test_identity_never_comes_from_message_text`).
+   owner" changes nothing (`test_identity_never_comes_from_message_text`) — and neither does one that
+   starts with `[cron]` or `[IMPORTANT:`, which are prefixes any person can type
+   (`test_a_machine_marker_in_a_guests_message_does_not_make_them_the_operator`,
+   `test_a_spoofed_marker_from_a_stranger_is_refused_like_any_stranger`).
 2. **Fail closed on unknown state.** A session with no human turn on it — a restart, a subagent, a
    tool driven from the socket — gets the guest allowlist, not the owner's
-   (`test_cold_session_map_blocks_restricted_tools`).
+   (`test_cold_session_map_blocks_restricted_tools`), and the refusal says the call carried no
+   identity instead of pretending a guest asked (`test_a_cold_session_refusal_says_why_instead_of_blaming_a_role`).
 3. **Identity is keyed on the turn, not the session.** Two people in one chat session (the
    `group_sessions_per_user: false` a household configures) are never confused for each other
    (`test_two_people_in_one_session_are_not_confused`).
@@ -165,23 +200,32 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
    shows two prompts that disagree (`test_a_second_ask_supersedes_the_first_code`).
 8. **Nothing is silent.** Every turn, tool decision, refusal, approval and token count is an audit
    row; `/many audit` shows them.
-6. **The owner can always act**, and can switch enforcement off with `/many pause` — which writes a
+9. **The owner can always act**, and can switch enforcement off with `/many pause` — which writes a
    loud audit row instead of quietly forgetting, and still tells the model who it is talking to.
-7. **Per-person memory is never merged.** No query in this plugin can read another person's facts:
+10. **Per-person memory is never merged.** No query in this plugin can read another person's facts:
    the namespace is a mandatory argument, not a filter.
-8. **The operator's own notes are withheld from everybody else.** `llm_request` middleware strips the
+11. **The operator's own notes are withheld from everybody else.** `llm_request` middleware strips the
    host's `MEMORY`/`USER PROFILE` blocks out of a non-owner's system prompt
    (`test_the_operators_memory_is_withheld_from_a_member`, and for the owner's own prompt
    `test_the_owners_own_prompt_is_left_alone`).
-9. **Only a human can approve.** `/many approve CODE` is a slash command on the owner's own message;
+12. **Only a human can approve.** `/many approve CODE` is a slash command on the owner's own message;
    there is no tool, hook or prompt path that can approve an escalation. An agent cannot talk itself
    into permission.
-10. **Machine-generated turns are the operator, not a stranger.** Cron prompts, internal notices and
-    auto-continuations are recorded and not policed — otherwise the plugin would lock the owner out
-    of their own scheduled jobs. The `[OUT-OF-BAND USER MESSAGE]` marker is deliberately **not** on
-    that list: the host uses it for mid-turn steering from the same human, and trusting it as the
-    operator would let a guest's steer run with owner tools.
-11. **Whitelist, not blacklist.** A tool nobody named is refused, including tools that ship next year,
+13. **A machine turn is a marker AND no sender.** A cron prompt arrives with no sender at all, is
+    recorded as the operator and is not policed — otherwise the plugin would lock the owner out of
+    their own scheduled jobs (`test_machine_generated_turn_skips_identity_resolution`). A marker
+    attached to a sender is that sender's turn: a member's `[cron] rm -rf /` still parks an approval
+    in the owner's DM (`test_a_machine_marker_in_a_members_message_does_not_skip_their_approval`). The
+    `[OUT-OF-BAND USER MESSAGE]` marker is deliberately **not** on that list: the host uses it for
+    mid-turn steering from the same human, and trusting it as the operator would let a guest's steer
+    run with owner tools.
+14. **The operator's own terminal is the operator.** Hermes hands a local turn `platform="cli"` with
+    `uid:<uid>` as the sender, and the gateway's control socket only reports that subject for a peer
+    whose uid is this process's own (`_posix_peer_subject`), so it is the same seat as "no sender at
+    all" (`test_the_operators_own_terminal_is_recognised_without_a_chat`). It is an exact match on the
+    attested subject, never a prefix test, and `local_seat_policy: roster` makes the terminal join
+    like anybody else (`test_local_seat_policy_roster_makes_the_terminal_join_like_anybody`).
+15. **Whitelist, not blacklist.** A tool nobody named is refused, including tools that ship next year,
     third-party plugin tools and MCP tools. A denylist fails open on every tool nobody thought of —
     which is how a *member's* default tool list once included the tools that grep the operator's own
     disk (see `test_a_member_cannot_reach_the_operators_files_by_default`, which now pins that shut).
@@ -280,14 +324,17 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 47 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 55 tests, stdlib unittest, no Hermes install
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
 hermes plugins validate ./                                   # the catalog CI gate
 ```
 
 `tests/selftest.py` drives the plugin with stub contexts and covers, among others: unknown sender
-refused under `closed`; invite admitted once and only once; identity never taken from message text;
+refused under `closed`; invite admitted once and only once; identity never taken from message text,
+including a guest's `[cron]`/`[IMPORTANT:` message and a stranger's; the owner's own terminal
+recognised from the attested uid while another account on `cli` is not, and `local_seat_policy:
+roster` opting out; a marker-shaped message from a person landing in the audit;
 a guest refused with a role-naming message; a member's dangerous tool parked under an owner code rather than refused; the owner's
 approval unlocking exactly one retry; an expired code refused; a second ask superseding the first;
 an explicit grant beating the ask bucket; a member unable to reach the operator's files; the roster

@@ -28,6 +28,16 @@ from typing import Any
 from . import identity, policy, store, transport
 from .runtime import Runtime
 
+#: Refusal for a tool call that carried no identity at all. Not a role, not a person: the host does
+#: not pass a session id to tools run from inside `execute_code`, from a subagent or from the socket,
+#: so the honest answer names that rather than pretending a guest asked.
+UNATTRIBUTED_REFUSAL = (
+    "I couldn't tell who this call belongs to, so I didn't run `{tool}`. Hermes passes no session id "
+    "for tools called from inside another tool (execute_code), from a subagent, or from the socket, "
+    "and this fails closed. Nothing ran — ask for it in a chat instead. The owner can set "
+    "`unknown_session_policy: operator` if every caller on this machine is trusted."
+)
+
 
 # --------------------------------------------------------------------------- context building
 
@@ -88,9 +98,13 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
 
     conn = rt.conn
 
-    # 1. The host talking to itself (cron, internal notices, auto-continuation). Recorded, never
-    #    policed — an operator's scheduled job is not a stranger.
-    if identity.is_machine_turn(user_message):
+    # 1. The host talking to itself (cron, internal notices, auto-continuation). A machine turn is a
+    #    marker AND no sender: MACHINE_MARKERS are prefixes on ordinary text, so anybody — guest,
+    #    member, stranger — can type `[cron] …` and the message arrives unchanged. Reading a role out
+    #    of that text is exactly the hole this plugin exists to close, so a turn the platform can
+    #    attribute is resolved as that sender, whatever its first characters are.
+    marked = identity.is_machine_turn(user_message)
+    if marked and not sender_id:
         rt.remember(session_id, identity.OPERATOR, platform or "host", turn_id=turn_id)
         rt.audit(
             kind="turn",
@@ -100,8 +114,34 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
             note="machine-generated turn (not policed)",
         )
         return None
+    if marked:
+        # Worth a row of its own: a message shaped like host output that the platform attributed to
+        # a person. Resolved below as that person; the audit note is what makes it visible.
+        rt.audit(
+            kind="policy",
+            session_id=session_id,
+            turn_id=turn_id,
+            note=(
+                f"message starts with a machine marker but the event names "
+                f"{platform or '?'}:{sender_id} — resolved as that sender"
+            ),
+        )
 
-    # 2. Resolve identity from the platform event. Message text is never evidence.
+    # 2. The operator's own terminal. Same seat as "no sender at all", attested by the platform
+    #    rather than typed: see identity.is_local_seat. `local_seat_policy: roster` opts out.
+    if sender_id and str(rt.setting("local_seat_policy", "operator")).lower() != "roster":
+        if identity.is_local_seat(platform, sender_id):
+            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id)
+            rt.audit(
+                kind="turn",
+                person_id=identity.OPERATOR,
+                session_id=session_id,
+                turn_id=turn_id,
+                note=f"local seat ({platform}:{sender_id}) — not policed",
+            )
+            return None
+
+    # 3. Resolve identity from the platform event. Message text is never evidence.
     person, refusal = identity.resolve(
         conn,
         platform=platform,
@@ -135,7 +175,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     pid = person["person_id"]
     rt.remember(session_id, pid, platform, turn_id=turn_id)
 
-    # 3. Daily budget (0 = unlimited). Tokens are counted from post_api_request, not estimated.
+    # 4. Daily budget (0 = unlimited). Tokens are counted from post_api_request, not estimated.
     cap = int(person.get("daily_tokens") or 0)
     if cap > 0 and not rt.paused:
         spent = store.tokens_today(conn, pid)
@@ -239,6 +279,7 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     action = decision["action"]
     allowed = action == policy.ALLOW
     needs = action == policy.ASK
+    message = decision["message"]
 
     rt.audit(
         kind="tool",
@@ -252,6 +293,11 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     )
 
     if action == policy.BLOCK:
+        if cold:
+            # Nobody's role is at fault here: the call carried no identity at all. Hermes passes no
+            # session id to tools run from inside `execute_code`, and a plugin that answered "ask the
+            # owner to make you a member" to the owner's own nested call would be lying about why.
+            message = UNATTRIBUTED_REFUSAL.format(tool=tool_name)
         rt.audit(
             kind="refusal",
             person_id=pid,
@@ -261,7 +307,7 @@ def _pre_tool_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
             allowed=False,
             note=decision["reason"],
         )
-        return {"action": "block", "message": decision["message"]}
+        return {"action": "block", "message": message}
 
     if needs:
         # The host's action gate (`request_tool_approval` → `_ACTION_GATE`) never consults approval

@@ -9,11 +9,18 @@ Two kinds of turn never reach the policy at all:
 * **machine-generated turns** (cron prompts, internal notifications, auto-continuations) are the
   operator talking to itself. They are recorded as the virtual ``operator`` person, which carries
   owner rights, because the alternative is a plugin that polices the owner's own scheduled jobs.
-* **the local CLI** has no sender at all and is by definition the operator's own seat.
+  A machine turn is recognised by its marker **and by having no sender**: the marker is a prefix on
+  text that any human can type, so a message that starts with ``[cron]`` from somebody the platform
+  names is that somebody's turn, resolved and policed like any other.
+* **the operator's own terminal** — ``platform="cli"`` plus the local subject the gateway's control
+  socket reports only for a peer with this process's own uid — is the same seat: see
+  ``is_local_seat``.
+* **a turn with no sender at all** (a platform that cannot name its user) is the operator's seat too.
 """
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from typing import Any
 
@@ -57,6 +64,39 @@ INVITE_PREFIXES = ("join ", "/join ", "many join ", "/many join ")
 def is_machine_turn(user_message: Any) -> bool:
     text = str(user_message or "").lstrip().lower()
     return any(text.startswith(marker) for marker in MACHINE_MARKERS)
+
+
+#: Platforms that are this machine's own terminal rather than a chat network.
+LOCAL_PLATFORMS: tuple[str, ...] = ("cli", "local")
+
+
+def local_seat_subject() -> str:
+    """The sender id this machine's own terminal shows up as, or "" when it cannot be attested."""
+    getuid = getattr(os, "getuid", None)  # windows-footgun: ok — absent on Windows, so no local seat
+    if getuid is None:
+        return ""
+    try:
+        return f"uid:{getuid()}"
+    except Exception:
+        return ""
+
+
+def is_local_seat(platform: str | None, sender_id: str | None) -> bool:
+    """Is this the operator's own terminal?
+
+    A local turn is not sender-less in every Hermes version: the gateway's control socket attests the
+    peer's uid and hands turns ``platform="cli"`` with ``uid:<uid>`` as the sender, and that subject
+    is returned **only** when the peer's uid equals this process's own (``gateway/control_socket.py``
+    ``_posix_peer_subject``). Same uid is the same trust boundary as "no sender at all", which is why
+    this seat is the operator. Anything else on those platforms is a different account and goes
+    through the roster like any other sender — the check is an exact match on the attested subject,
+    never a prefix test on message text.
+    """
+    platform = str(platform or "").strip().lower()
+    if platform not in LOCAL_PLATFORMS:
+        return False
+    subject = local_seat_subject()
+    return bool(subject) and str(sender_id or "").strip() == subject
 
 
 def invite_attempt(user_message: Any) -> str | None:

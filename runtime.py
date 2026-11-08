@@ -32,6 +32,11 @@ DEFAULTS: dict[str, Any] = {
     # Whether a session that never carried a human turn may use the tools it asks for.
     # "guest" fails closed for restricted tools; "operator" trusts the host's own callers.
     "unknown_session_policy": "guest",
+    # The operator's own terminal (platform cli/local with this machine's uid): "operator" is the
+    # host's own seat, "roster" makes it join like any other sender.
+    "local_seat_policy": "operator",
+    # Where the SQLite file lives. Empty = the host's plugin data dir; set it in config.yaml.
+    "db_path": "",
     # Strip the host's own MEMORY/USER blocks from a non-owner's system prompt (middleware.py).
     "scope_host_memory": True,
 }
@@ -86,6 +91,12 @@ class Runtime:
     def db_path(self) -> Path:
         if self._override_path is not None:
             return self._override_path
+        # The supported knob is `db_path` in config.yaml (plugin.yaml config_schema). The env var
+        # stays as the escape hatch for the stdlib test scripts and one-off migrations; it never
+        # wins over what the operator configured.
+        configured = str(self.setting("db_path", "") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
         env = os.environ.get("MANYHANDS_DB")
         if env:
             return Path(env)
