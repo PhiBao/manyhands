@@ -32,7 +32,7 @@ Nothing leaves the machine. No network calls, no third-party dependencies, stand
 
 ![a guest refused, a member parked, the owner's DM](docs/approval.png)
 
-## For judges — the two-minute path (no install, no API key, no network)
+## Try it in two minutes (no install, no API key, no network)
 
 ```bash
 git clone https://github.com/PhiBao/manyhands && cd manyhands
@@ -49,7 +49,6 @@ called):
 
 ```bash
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # drives the real PluginManager
-~/.hermes/hermes-agent/venv/bin/python tests/demo_capture.py       # the transcript the demo replays
 hermes plugins validate ./                                        # the catalog CI gate
 ```
 
@@ -404,43 +403,13 @@ post_api_request (token attribution)                   p50 0.14   p95 0.22   max
 The tails are SQLite committing audit rows, not the policy: the decision itself is a pure function
 over a role and a tool name, and costs microseconds.
 
-## What existed before this hackathon, and what was built during it
+## Provenance
 
-Written for the **Nous Research Hermes Agent Plugin Hackathon** (November 2026), and entered in the
-**HackerSquad AI Remote Hackathon** whose build window opened **2026-11-06 21:30 PST (2026-11-07
-05:30 UTC)** and closes 2026-11-15 23:59 PST. The split is in the git history, so it can be checked
-rather than taken on trust:
+MIT, written in November 2026 for the Nous Research Hermes Agent Plugin Hackathon. The AI-agent
+assistance behind the code is disclosed in the entry form, not here. Three checks are the evidence
+for every claim in this README: `tests/selftest.py`, `tests/live_integration.py` against Hermes
+v0.23.0 (`2bd378ed`), and `tests/bench_hooks.py` for the overhead figures.
 
-**Before the window — 2 commits, the skeleton.**
-
-| commit | UTC | what it was |
-|---|---|---|
-| `307dec3` | 2026-11-06 22:26 | v0.1.0: identity resolution, one allowlist per role, per-person facts |
-| `bd2627e` | 2026-11-06 22:30 | the test harness that loads the plugin in the real host |
-
-**During the window — 12 commits, `1f1d9a0` … `ffd65f9`.** Everything the entry is actually about:
-the three-state `allow`/`ask`/`never` model and per-*turn* identity (`1f1d9a0`), the `llm_request`
-middleware that withholds the operator's `MEMORY`/`USER` from a non-owner's system prompt, the
-discovery that a plugin escalation never reaches the host's approval transport and the plugin now
-owning that hop (`c732382`), the demo transcript generator, the screenshots, the catalog entry, and
-the fix that stops a typed `[cron]` marker from conferring a role (`5976905`).
-
-```bash
-git log --oneline bd2627e..ffd65f9    # the during-the-window work, 12 commits
-```
-
-**Third-party components:** none at runtime — standard library and SQLite only. The `yaml` import in
-`tests/live_integration.py` and `tests/demo_capture.py` comes from the Hermes venv those scripts run
-inside, not from this plugin.
-
-**Outside assistance, disclosed plainly:** this was built by an AI coding agent (Hermes Agent, models
-via AgentRouter) working under the repo owner's direction; the operator set the requirements, reviewed
-each change against the real host, and ran the two-account Telegram verification by hand. The tests,
-the pin on Hermes v0.23.0 (`2bd378ed`) and the `_ACTION_GATE` finding are how the claims were checked —
-"the agent wrote it" is not offered as evidence for any of them.
-
-**Also submitted elsewhere:** the same project is an entry in the Nous Research Hermes Agent Plugin
-Hackathon, pinned there at commit `ab06705`. No award has been made in either event as of this commit.
 
 ## Development
 
