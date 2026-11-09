@@ -55,7 +55,7 @@ https://github.com/NousResearch/hermes-agent/pull/150807
 - Plugin repo: `https://github.com/PhiBao/manyhands` (pinned in the entry at `ab06705`)
 - Demo video: 76 s, `~/hackathon/manyhands-demo.mp4`; every frame's terminal text is real output from
   `tests/demo_capture.py`
-- What is verified: `python3 tests/selftest.py` → 47 tests; `tests/live_integration.py` → PASS through
+- What is verified: `python3 tests/selftest.py` → 55 tests; `tests/live_integration.py` → PASS through
   the real host; `hermes plugins validate ./` → passed; plus a live two-account Telegram run
   (stranger refused → invite → guest → member → parked ask → owner DM → one-shot grant → ran once →
   next ask parked again)
