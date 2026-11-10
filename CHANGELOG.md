@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.1 — the tool surface gets the rule the command surface already had
+
+Found by applying 0.4.0's question to the six tools instead of just `/many`.
+
+- **`manyhands_audit` with no person named read the whole household's trail** to any caller — tool
+  names, token counts, refusal notes — and listed every pending approval code with its asker. That is
+  the same disclosure 0.4.0 closed on `/many audit` and a bare `/many approve`. A member now gets
+  their own trail (`subject: "you"`) and only their own parked asks; the owner and the host's own seat
+  still read the house.
+- 64 tests (+1, which fails against 0.5.0 with `'everyone' != 'you'`).
+
 ## 0.5.0 — a tool call belongs to whoever asked for it
 
 Found while re-reading the tool path after the 0.4.0 command fix, on `30fa4f0`. The gate was right;

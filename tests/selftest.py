@@ -877,6 +877,26 @@ class ToolIdentity(unittest.TestCase):
         who = json.loads(call_tool(rt, "manyhands_whoami", session="just-minh"))
         self.assertEqual(who["person_id"], "telegram:222")
 
+    def test_the_audit_tool_reads_the_house_only_for_the_owner(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="111", session="al", task="a")
+        turn(rt, sender="222", session="al", task="b")
+        store.open_approval(
+            rt.conn, code="GH78", person_id="telegram:111", tool="terminal",
+            summary="Kiter wants terminal", expires_at=time.time() + 300,
+        )
+        # the member's own call, with no target: their trail only
+        mine = json.loads(call_tool(rt, "manyhands_audit", session="al", task="b"))
+        report = json.dumps(mine)
+        self.assertEqual(mine["subject"], "you")
+        self.assertNotIn("telegram:111", report)
+        self.assertNotIn("GH78", report, "another person's parked ask is not a noticeboard")
+        # the owner sees the house, including the parked ask
+        theirs = json.loads(call_tool(rt, "manyhands_audit", session="al", task="a"))
+        self.assertEqual(theirs["subject"], "everyone")
+        self.assertIn("GH78", json.dumps(theirs))
+
 
 class ThreeStates(unittest.TestCase):
     def test_a_member_is_escalated_rather_than_refused(self):

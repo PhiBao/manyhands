@@ -36,7 +36,7 @@ Nothing leaves the machine. No network calls, no third-party dependencies, stand
 
 ```bash
 git clone https://github.com/PhiBao/manyhands && cd manyhands
-python3 tests/selftest.py        # 63 tests, ~14 s, standard library only
+python3 tests/selftest.py        # 64 tests, ~15 s, standard library only
 ```
 
 That is the whole core loop, checked without Hermes, a bot token or a model key: a stranger refused,
@@ -92,7 +92,7 @@ conversation does not exist in the marketplace.**
 | tool | `manyhands_remember` | write a fact into the **caller's own** namespace |
 | tool | `manyhands_recall` | search the caller's facts + shared facts |
 | tool | `manyhands_share` | publish a fact to everyone (owner/member) |
-| tool | `manyhands_audit` | turns, tool calls, refusals, approvals, tokens |
+| tool | `manyhands_audit` | turns, tool calls, refusals, approvals, tokens — your own trail, the whole house only for the owner |
 | hook | `pre_llm_call` | resolve identity, apply the unknown-sender policy, enforce the daily budget, inject the person card, record `turn_id → person_id` (and the session fallback) |
 | hook | `pre_tool_call` | three-state allow/ask/never per role; escalate to approval; **fail closed** on unknown sessions |
 | hook | `post_api_request` | attribute token usage to whoever owns the turn |
@@ -285,6 +285,9 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
     `llm_request` middleware **withhold** the operator's memory on an unattributable request in a
     shared session instead of failing open
     (`test_an_unattributable_request_in_a_shared_session_is_withheld_not_failed_open`).
+    The same rule holds on the **tool** surface, not just `/many`: `manyhands_audit` with no person
+    named reports your own trail, and another person's parked code and tool never appear in it
+    (`test_the_audit_tool_reads_the_house_only_for_the_owner`).
 
 ## How the pieces fit (the four gotchas that shaped it)
 
@@ -395,7 +398,7 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 63 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 64 tests, stdlib unittest, no Hermes install
 python3 tests/probe_command_actor.py                          # /many identity + listing, this tree vs. any sha
 python3 tests/probe_tool_identity.py                          # tool-call identity, this tree vs. any sha
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn

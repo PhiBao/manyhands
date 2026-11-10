@@ -282,11 +282,28 @@ def audit(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", tas
             if not matches:
                 return _err(f"no person matches {target!r}")
             person_id = matches[0]["person_id"]
+        privileged = _is_owner(caller) or str(caller.get("person_id") or "") == identity.OPERATOR
+        if not target and not privileged:
+            # No target means "everyone", and across a household that is everybody's tool names, token
+            # counts and refusal notes. A member reads their own trail; only the owner reads the house.
+            if not caller.get("person_id"):
+                return _err(
+                    "no person is attached to this conversation, so there is no trail of yours to read",
+                    you=identity.label(caller),
+                )
+            person_id = caller["person_id"]
+
+        pending = store.pending_approvals(rt.conn)
+        if not privileged:
+            # A code plus who asked for what tool is the owner's queue, not a household noticeboard.
+            pending = [
+                row for row in pending if row.get("person_id") == caller.get("person_id")
+            ]
 
         summary = store.audit_summary(rt.conn, person_id=person_id, hours=hours)
         rows = store.audit_rows(rt.conn, person_id=person_id, hours=hours, limit=limit)
         return _ok(
-            subject=target or "everyone",
+            subject=target or ("everyone" if privileged else "you"),
             hours=hours,
             summary=summary,
             recent=[
@@ -307,7 +324,7 @@ def audit(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", tas
             ],
             pending_approvals=[
                 {"code": row["code"], "who": row.get("person_id"), "tool": row.get("tool")}
-                for row in store.pending_approvals(rt.conn)
+                for row in pending
             ],
         )
     except Exception as exc:
