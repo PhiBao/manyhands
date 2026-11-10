@@ -41,7 +41,10 @@ dest = HOME / "plugins" / "manyhands"
 shutil.copytree(REPO, dest, ignore=shutil.ignore_patterns("__pycache__", ".git", "*.sqlite*", "docs"))
 
 sys.path.insert(0, str(HERMES_SRC))
-import yaml  # noqa: E402  (the Hermes venv ships it)
+try:
+    import yaml  # noqa: E402  (PyYAML, when the interpreter has it)
+except ModuleNotFoundError:  # newer hosts vendor ruamel behind hermes_yaml instead
+    import hermes_yaml as yaml  # noqa: E402
 
 (HOME / "config.yaml").write_text(
     yaml.safe_dump(
@@ -284,6 +287,53 @@ out["whoami_via_registry"] = json.loads(
     registry.dispatch("manyhands_whoami", {}, session_id="sess-minh")
 )
 
+# 5 — the real `/many` boundary. The gateway dispatches a plugin command through
+# `invoke_plugin_command(handler, raw_args, source=SessionSource(...), session_id=...)`, which is the
+# only place a command learns WHO typed it. These two drive that path with the host's own classes:
+# an unrostered sender inside a session whose last speaker was the owner must not inherit that seat,
+# and a bare `/many approve` must not list somebody else's parked ask.
+from gateway.config import Platform  # noqa: E402
+from gateway.session import SessionSource  # noqa: E402
+from hermes_cli.plugin_command_dispatch import invoke_plugin_command  # noqa: E402
+
+_many = P.get_plugin_command_handler("many")
+if _many is None:
+    print("FAIL: the host did not register the /many command")
+    raise SystemExit(1)
+
+
+def as_command(raw_args, uid, chat, chat_type="group"):
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id=chat, chat_type=chat_type, user_id=uid,
+    )
+    return invoke_plugin_command(
+        _many, raw_args, source=source, session_id=chat, session_key=chat, platform="telegram"
+    )
+
+
+shared_live = "sess-household"  # group_sessions_per_user: false: one session, several people
+invoke_hook(
+    "pre_llm_call", session_id=shared_live, task_id="t8", turn_id="turn-8",
+    user_message="hi all", conversation_history=[], is_first_turn=True,
+    model="probe", platform="telegram", parent_session_id=None, sender_id="111",
+)
+out["household_last_speaker"] = (rt.person_for_session(shared_live)[0] or {}).get("person_id")
+_code5 = "LIVE1"
+store.open_approval(
+    rt.conn, code=_code5, person_id="telegram:222", tool="terminal",
+    summary='Minh wants terminal {"command": "cat ~/.ssh/id_rsa"}',
+    expires_at=time.time() + 300,
+)
+out["cmd_stranger_approve"] = as_command(f"approve {_code5}", "999", shared_live)
+out["cmd_stranger_pause"] = as_command("pause", "999", shared_live)
+out["cmd_stranger_invite"] = as_command("invite owner", "999", shared_live)
+out["cmd_stranger_bare_approve"] = as_command("approve", "999", shared_live)
+out["cmd_guest_bare_approve"] = as_command("approve", "333", shared_live)
+out["cmd_asker_bare_approve"] = as_command("approve", "222", shared_live)
+out["cmd_owner_bare_approve"] = as_command("approve", "111", shared_live)
+out["cmd_owner_pause"] = as_command("pause", "111", shared_live)
+out["cmd_owner_resume"] = as_command("resume", "111", shared_live)
+
 print(json.dumps(out, indent=2, default=str))
 print("\naudit:", store.audit_summary(rt.conn, hours=1))
 
@@ -313,6 +363,18 @@ ok = (
     and out["cron_not_blocked"]                 # the real cron shape (no sender) is the operator
     and out["cron_terminal"] is None
     and out.get("local_seat_terminal", None) is None   # the host's own terminal is never a stranger
+    and out["household_last_speaker"] == "telegram:111"   # premise: the owner spoke last in it
+    and "only the owner" in out["cmd_stranger_approve"]   # …and a named stranger never inherits it
+    and "only the owner" in out["cmd_stranger_pause"]
+    and "only the owner" in out["cmd_stranger_invite"]
+    and _code5 not in out["cmd_stranger_bare_approve"]    # no code, no asker args, for a stranger
+    and "id_rsa" not in out["cmd_stranger_bare_approve"]
+    and _code5 not in out["cmd_guest_bare_approve"]
+    and _code5 in out["cmd_asker_bare_approve"]           # the asker sees their own ask
+    and _code5 in out["cmd_owner_bare_approve"]           # the owner sees the queue, args included
+    and "id_rsa" in out["cmd_owner_bare_approve"]
+    and "paused" in out["cmd_owner_pause"]                # and the owner still owns it
+    and "back on" in out["cmd_owner_resume"]
     and out["middleware_member_changed"]
     and out["middleware_member_memory_withheld"]
     and out["middleware_member_card_injected"]

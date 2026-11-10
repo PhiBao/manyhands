@@ -646,6 +646,127 @@ class CommandSurface(unittest.TestCase):
         self.assertIn("Minh", roster)
 
 
+class CommandActor(unittest.TestCase):
+    """Who a `/many` command is attributed to, and how much it may then read."""
+
+    @staticmethod
+    def _src(uid, chat="room1", chat_type="group", platform="telegram"):
+        return types.SimpleNamespace(
+            platform=types.SimpleNamespace(value=platform),
+            user_id=uid,
+            chat_id=chat,
+            chat_type=chat_type,
+        )
+
+    def test_an_unrostered_sender_in_a_shared_session_never_inherits_the_owners_seat(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        shared = "household-chat"  # group_sessions_per_user: false
+        turn(rt, sender="111", session=shared)  # the owner speaks last: the session map says owner
+        person, _how = rt.person_for_session(shared)
+        self.assertEqual(person["person_id"], "telegram:111", "premise: the session map holds the owner")
+        code = "AB12"
+        store.open_approval(
+            rt.conn,
+            code=code,
+            person_id="telegram:222",
+            tool="terminal",
+            summary='Minh wants terminal {"command": "rm -rf build"}',
+            expires_at=time.time() + 300,
+        )
+
+        stranger = self._src("999", chat=shared)  # the gateway let them in; the roster never saw them
+        self.assertIn(
+            "only the owner",
+            manyhands._cmd(rt, f"approve {code}", source=stranger, session_id=shared),
+        )
+        self.assertIn("only the owner", manyhands._cmd(rt, "pause", source=stranger, session_id=shared))
+        self.assertIn(
+            "only the owner", manyhands._cmd(rt, "invite owner", source=stranger, session_id=shared)
+        )
+        # nothing they did changed anything
+        self.assertEqual(len(store.pending_approvals(rt.conn)), 1, "the ask still waits for the owner")
+        self.assertFalse(rt.paused)
+        self.assertEqual(store.open_invites(rt.conn), [])
+        # and they are described as who they are: an unplaced guest, not the owner
+        who = manyhands._cmd(rt, "whoami", source=stranger, session_id=shared)
+        self.assertIn("guest", who)
+        self.assertIn("unknown", who)
+        self.assertNotIn("telegram:111", who)
+        # the owner, typing in that same session, still owns it
+        owner = self._src("111", chat=shared)
+        self.assertIn("invite code", manyhands._cmd(rt, "invite owner", source=owner, session_id=shared))
+        self.assertIn("enforcement is **paused**", manyhands._cmd(rt, "pause", source=owner, session_id=shared))
+        self.assertIn(f"`{code}` approved", manyhands._cmd(rt, f"approve {code}", source=owner, session_id=shared))
+
+    def test_a_bare_many_approve_lists_only_your_own_ask(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="household")
+        code = "CD34"
+        store.open_approval(
+            rt.conn,
+            code=code,
+            person_id="telegram:222",
+            tool="terminal",
+            summary='Minh wants terminal {"command": "cat ~/.ssh/id_rsa"}',
+            expires_at=time.time() + 300,
+        )
+
+        mine = manyhands._cmd(rt, "approve", source=self._src("222"), session_id="household")
+        self.assertIn(code, mine)
+        self.assertIn("waiting on the owner", mine)
+        for other in ("333", "999"):  # a guest, and somebody the roster never saw
+            listing = manyhands._cmd(rt, "approve", source=self._src(other), session_id="household")
+            self.assertNotIn(code, listing)
+            self.assertNotIn("id_rsa", listing, "the asker's own arguments are the asker's")
+            self.assertIn("nothing of yours", listing)
+        owners = manyhands._cmd(rt, "approve", source=self._src("111"), session_id="household")
+        self.assertIn(code, owners)
+        self.assertIn("id_rsa", owners)
+
+    def test_the_house_wide_trail_and_the_platform_ids_are_owner_only(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        shared = "household"
+        turn(rt, sender="111", session=shared)
+        turn(rt, sender="222", session=shared)
+        # a member reads their own trail, never the owner's rows
+        member = manyhands._cmd(rt, "audit", source=self._src("222", chat=shared), session_id=shared)
+        self.assertIn("telegram:222", member)
+        self.assertNotIn("telegram:111", member)
+        owner = manyhands._cmd(rt, "audit", source=self._src("111", chat=shared), session_id=shared)
+        self.assertIn("telegram:222", owner)
+        # the roster names people to everybody on it, and their account ids to the owner only
+        guest_roster = manyhands._cmd(rt, "roster", source=self._src("333", chat=shared), session_id=shared)
+        self.assertIn("Kiter", guest_roster)
+        self.assertNotIn("telegram:111", guest_roster)
+        owner_roster = manyhands._cmd(rt, "roster", source=self._src("111", chat=shared), session_id=shared)
+        self.assertIn("telegram:111", owner_roster)
+        # somebody who is not on it gets none of it
+        ghost = manyhands._cmd(rt, "roster", source=self._src("999", chat=shared), session_id=shared)
+        self.assertIn("not on this roster", ghost)
+        self.assertNotIn("Kiter", ghost)
+        self.assertIn(
+            "not on this roster", manyhands._cmd(rt, "audit", source=self._src("999", chat=shared), session_id=shared)
+        )
+
+    def test_the_operators_own_terminal_still_speaks_as_the_operator(self):
+        subject = identity.local_seat_subject()
+        if not subject:
+            self.skipTest("no getuid on this platform: there is no local seat to attest")
+        local = self._src(subject, chat="cli", chat_type="dm", platform="cli")
+        rt = new_runtime()
+        seed_roster(rt)
+        who = manyhands._cmd(rt, "whoami", source=local, session_id="cli-1")
+        self.assertIn("operator", who)
+        self.assertIn("owner", who)
+        # `local_seat_policy: roster` is the documented opt-out: the seat joins like anybody else
+        rt2 = new_runtime({"local_seat_policy": "roster"})
+        seed_roster(rt2)
+        self.assertIn("guest", manyhands._cmd(rt2, "whoami", source=local, session_id="cli-2"))
+
+
 class PolicySurface(unittest.TestCase):
     def test_allowlist_is_the_whole_policy(self):
         # anything nobody named is refused, including tools that do not exist yet

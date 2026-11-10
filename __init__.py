@@ -48,34 +48,53 @@ def _source_identity(source: Any) -> tuple[str, str]:
     return str(platform), sender
 
 
+def _unknown_actor(platform: str, sender: str) -> dict[str, Any]:
+    """Somebody the platform named whom this roster does not hold. Guest, and nothing else."""
+    return {
+        "person_id": None,
+        "role": policy.GUEST,
+        "platform": platform,
+        "sender_id": sender,
+        "display": sender or None,
+    }
+
+
 def _actor(rt: Runtime, source: Any, session_id: str) -> tuple[dict[str, Any], str]:
     """Who typed this slash command, and how we know.
 
     The gateway hands a command handler the ``SessionSource`` of the message that carried it, so a
-    command is attributable to the human who sent it — the same identity the turn hook uses. A local
-    CLI seat has no source at all and is the operator's own.
+    command is attributable to the human who sent it — the same identity the turn hook uses. The
+    order mirrors ``hooks._pre_llm_call``, and the ordering is the security property:
+
+      1. a sender the platform names that the roster holds -> that person;
+      2. a sender the platform names that IS this machine's own terminal -> the operator
+         (``local_seat_policy: roster`` opts out, the same switch the turn hook honours);
+      3. a sender the platform names with **no** roster row -> an unknown guest.
+
+    The session map is consulted in case 4 only — a source that carries no sender at all. It maps
+    one session to whoever spoke last, and a session is frequently shared
+    (``group_sessions_per_user: false``, the household this plugin targets), so using it to place a
+    *named* stranger hands them the owner's seat whenever the owner spoke last: their role, their
+    tools, ``/many approve`` over parked asks, ``/many pause`` and ``/many invite owner``.
     """
     platform, sender = _source_identity(source)
+
     if sender:
         row = store.get_person_by_sender(rt.conn, platform, sender)
         if row:
             return row, "source"
+        if str(rt.setting("local_seat_policy", "operator")).lower() != "roster":
+            if identity.is_local_seat(platform, sender):
+                return dict(identity.OPERATOR_PERSON), "local"
+        return _unknown_actor(platform, sender), "unknown"
+
     if session_id:
         person, how = rt.person_for_session(session_id)
         if person:
             return person, how
-    if source is None and not sender:
+    if source is None:
         return dict(identity.OPERATOR_PERSON), "local"
-    return (
-        {
-            "person_id": None,
-            "role": policy.GUEST,
-            "platform": platform,
-            "sender_id": sender,
-            "display": sender or None,
-        },
-        "unknown",
-    )
+    return _unknown_actor(platform, sender), "unknown"
 
 
 def _role_of(person: dict[str, Any]) -> str:
@@ -84,6 +103,19 @@ def _role_of(person: dict[str, Any]) -> str:
 
 def _is_owner(person: dict[str, Any]) -> bool:
     return _role_of(person) == policy.OWNER
+
+
+def _is_operator(person: dict[str, Any]) -> bool:
+    return person.get("person_id") == identity.OPERATOR
+
+
+def _privileged(person: dict[str, Any]) -> bool:
+    """Owner or the host's own seat: the only callers who may read across people."""
+    return _is_owner(person) or _is_operator(person)
+
+
+def _on_roster(person: dict[str, Any]) -> bool:
+    return bool(person.get("person_id"))
 
 
 # --------------------------------------------------------------------------- /many
@@ -115,20 +147,31 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
 
         # ---- roster ------------------------------------------------------------
         if verb in {"roster", "people", "list"}:
+            if not _on_roster(person):
+                return (
+                    "you are not on this roster yet, so there is nobody to list. Ask the owner for "
+                    "an invite code, then reply `join CODE` with it."
+                )
             rows = store.list_people(rt.conn)
             if not rows:
                 return (
                     "the roster is empty — `/many claim` from the bot's own terminal mints a claim "
                     "code, then `/many claim CODE` in this chat makes you the owner"
                 )
+            privileged = _privileged(person)
             lines = [f"**roster** — {len(rows)} people"]
             for row in rows:
                 n_facts = store.count_facts(rt.conn, row["person_id"])
-                lines.append(
+                line = (
                     f"- **{identity.label(row)}** · {policy.describe_role(row.get('role') or '', row.get('tools'))}"
                     f" · {n_facts} fact{'' if n_facts == 1 else 's'}"
-                    f" · `{row['person_id']}`"
                 )
+                # Platform ids are the owner's to see: a roster is a list of people, not a directory
+                # of accounts for whoever happens to be talking to the bot (the same rule the
+                # manyhands_people tool applies).
+                if privileged:
+                    line += f" · `{row['person_id']}`"
+                lines.append(line)
             invites = store.open_invites(rt.conn)
             if invites and _is_owner(person):
                 lines.append(f"open invite codes: {', '.join(i['code'] for i in invites)}")
@@ -192,19 +235,39 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
             code = rest.split()[0].upper() if rest else ""
             choice = (rest.split()[1].lower() if len(rest.split()) > 1 else "once")
             if not code:
+                # A bare `/many approve` is a listing, so it is a disclosure surface: codes plus a
+                # summary that carries the asker's own tool arguments. The owner decides every ask,
+                # so the owner is the only one who reads the whole queue; everybody else sees the
+                # asks that are theirs, and learns nothing about who else asked for what.
                 pending = store.pending_approvals(rt.conn)
                 if not pending:
                     return "nothing is waiting on an approval"
-                lines = ["**waiting on you**"]
-                for row in pending:
-                    lines.append(f"- `{row['code']}` · {row.get('summary') or row.get('tool')}")
-                lines.append("`/many approve CODE` or `/many deny CODE`")
+                if _privileged(person):
+                    lines = ["**waiting on you**"]
+                    for row in pending:
+                        lines.append(f"- `{row['code']}` · {row.get('summary') or row.get('tool')}")
+                    lines.append("`/many approve CODE` or `/many deny CODE`")
+                    return "\n".join(lines)
+                mine = [
+                    row
+                    for row in pending
+                    if person.get("person_id") and row.get("person_id") == person.get("person_id")
+                ]
+                if not mine:
+                    return (
+                        "nothing of yours is waiting on an approval — the owner answers everyone "
+                        "else's asks in their own DM."
+                    )
+                lines = ["**yours, waiting on the owner**"]
+                for row in mine:
+                    lines.append(f"- `{row['code']}` · {row.get('tool') or 'tool call'}")
+                lines.append("`/many deny CODE` withdraws one of your own; only the owner approves.")
                 return "\n".join(lines)
             approving = verb in {"approve", "yes", "allow"}
-            allowed = approving and (_is_owner(person) or person.get("person_id") == identity.OPERATOR)
+            allowed = approving and _privileged(person)
             if not allowed and approving:
                 return "only the owner can approve a tool call"
-            if not approving and not (_is_owner(person) or person.get("person_id") == identity.OPERATOR):
+            if not approving and not _privileged(person):
                 # the asker may always refuse their own request
                 row = store.decision_for(rt.conn, code)
                 if not row or row.get("person_id") != person.get("person_id"):
@@ -290,6 +353,16 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
                 if not matches:
                     return f"no person matches {target!r}"
                 person_id = matches[0]["person_id"]
+            elif not _privileged(person):
+                # No target means "everything", and across a household that is everybody's tool
+                # names, token counts and refusal notes. A member reads their own trail; only the
+                # owner reads the house.
+                if not _on_roster(person):
+                    return (
+                        "you are not on this roster yet, so there is no trail of yours to read. Ask "
+                        "the owner for an invite code."
+                    )
+                person_id = person["person_id"]
             summary = store.audit_summary(rt.conn, person_id=person_id, hours=hours)
             rows = store.audit_rows(rt.conn, person_id=person_id, hours=hours, limit=12)
             def _p(n: int, word: str) -> str:
@@ -318,7 +391,7 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
                     bit += f" · {row['note']}"
                 body.append(bit)
             pending = store.pending_approvals(rt.conn)
-            if pending:
+            if pending and _privileged(person):
                 body.append("")
                 body.append("waiting on approval: " + ", ".join(f"`{p['code']}`" for p in pending))
             return "\n".join([head] + body)

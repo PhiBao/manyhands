@@ -36,7 +36,7 @@ Nothing leaves the machine. No network calls, no third-party dependencies, stand
 
 ```bash
 git clone https://github.com/PhiBao/manyhands && cd manyhands
-python3 tests/selftest.py        # 55 tests, ~13 s, standard library only
+python3 tests/selftest.py        # 59 tests, ~14 s, standard library only
 ```
 
 That is the whole core loop, checked without Hermes, a bot token or a model key: a stranger refused,
@@ -98,7 +98,7 @@ conversation does not exist in the marketplace.**
 | hook | `post_api_request` | attribute token usage to whoever owns the turn |
 | middleware | `llm_request` | withhold the operator's own MEMORY/USER blocks from a non-owner's system prompt, and put the person card where it belongs (the system prompt) |
 | transport | `manyhands` | dangerous-command prompts to the **owner's DM** under a short code (plugin escalations are parked and DM'd by the hook itself) |
-| command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve <code> · deny <code>` |
+| command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve [code] · deny <code>` — a bare `approve` lists the queue, and only to the owner |
 
 Tested on **Hermes Agent v0.23.0** (`2bd378ed`), Linux.
 
@@ -196,7 +196,8 @@ A plugin-triggered message reaches the gateway through
 *"Submit a plugin-triggered turn to the live gateway."* An approval prompt is therefore a **turn** in
 your own conversation, not a side channel: it costs one model call in the owner's chat, and the agent
 sees it as context on its next turn. Keep `approval_timeout_s` honest (the default 120 s) so a stale
-prompt cannot sit in the chat for long, and read the code off `/many pending` if the chat scrolled.
+prompt cannot sit in the chat for long, and read the code off a bare `/many approve`, which lists
+what is waiting for you.
 
 ## The safety contract
 
@@ -256,6 +257,22 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
     third-party plugin tools and MCP tools. A denylist fails open on every tool nobody thought of —
     which is how a *member's* default tool list once included the tools that grep the operator's own
     disk (see `test_a_member_cannot_reach_the_operators_files_by_default`, which now pins that shut).
+16. **A slash command is attributed to the sender the platform names, and to nobody else.** The
+    gateway hands a command handler the `SessionSource` of the message that carried it
+    (`invoke_plugin_command(..., source=…)`), so `/many` resolves identity exactly the way the turn
+    hook does — roster row, then the attested local seat, then *guest*. The session fallback is used
+    only by a source that carries **no** sender. That ordering is the property: a session is often
+    shared (`group_sessions_per_user: false`), so falling back to "whoever spoke last" inside the
+    owner's own chat handed a stranger the owner's role, `/many approve`, `/many pause` and
+    `/many invite owner` (`test_an_unrostered_sender_in_a_shared_session_never_inherits_the_owners_seat`,
+    reproduced against the reviewed commit with `tests/probe_command_actor.py`).
+17. **A command answers only about its caller.** A bare `/many approve` is a listing, so it is gated:
+    the owner reads the whole queue with each asker's arguments, everyone else sees the asks that are
+    theirs and learns nothing about who else asked for what
+    (`test_a_bare_many_approve_lists_only_your_own_ask`). `/many audit` with no name reads your own
+    trail unless you are the owner, `/many roster` shows platform ids to the owner only, and somebody
+    who is not on the roster gets neither
+    (`test_the_house_wide_trail_and_the_platform_ids_are_owner_only`).
 
 ## How the pieces fit (the four gotchas that shaped it)
 
@@ -351,7 +368,8 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 55 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 59 tests, stdlib unittest, no Hermes install
+python3 tests/probe_command_actor.py                          # the two /many findings, this tree vs. any sha
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
 hermes plugins validate ./                                   # the catalog CI gate
@@ -371,13 +389,18 @@ going to `chat_id == owner` and timing out to deny; an approved code letting the
 delivery failure failing closed; the owner's memory withheld from a member and left alone for the
 owner; per-person memory never leaking; shared facts visible to all; machine-generated turns skipping
 identity resolution; pause dropping enforcement but keeping the person card; the audit counting
-turns/tools/refusals/tokens; and the daily budget blocking the next turn.
+turns/tools/refusals/tokens; an unrostered sender in a session whose last speaker was the owner kept
+out of `/many approve`/`pause`/`invite`; a bare `/many approve` listing only the caller's own ask;
+the house-wide trail and the platform ids staying with the owner; and the daily budget blocking the
+next turn.
 
 `tests/live_integration.py` is the half that unit tests cannot prove: it copies the plugin into a
 throwaway `HERMES_HOME`, loads it through the **real** `PluginManager`, and drives the host's own
 dispatch — `hermes_cli.lifecycle.invoke_hook("pre_llm_call", …)`,
 `hermes_cli.plugins.get_pre_tool_call_directive(…)`, `hermes_cli.middleware.apply_llm_request_middleware(…)`,
-`tools.registry.dispatch(…)` and a real `ApprovalRequest` from `hermes_cli.approval_transport`. Last run:
+`tools.registry.dispatch(…)` and a real `ApprovalRequest` from `hermes_cli.approval_transport` — plus,
+since 0.4.0, `/many` through the real `invoke_plugin_command(…, source=SessionSource(…))` boundary that
+the gateway uses, which is the only place a command learns who typed it. Last run:
 
 ```
 member_card        [manyhands] This turn's speaker is Minh (member, id telegram:222) …
@@ -387,6 +410,8 @@ member+web_search  None                   cold session        "block"
 owner+terminal     None                   shared session      guest "block", guest web None
 llm_request mw     member: memory withheld + card injected; owner: untouched
 no gateway         deny in 0.0 s   no answer  deny at 5.0 s   prompt → telegram:111 (owner)
+/many as a stranger in the owner's session: approve/pause/invite all "only the owner"
+bare /many approve: stranger "nothing of yours", asker sees their code, owner sees code + args
 LIVE INTEGRATION: PASS
 ```
 

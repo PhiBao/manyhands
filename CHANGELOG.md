@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.4.0 — a command belongs to whoever typed it
+
+Found in the second catalog review, on `5976905`. The turn path was already correct; the **slash
+command** path was not, and it is the one that can hand out approvals.
+
+- **`/many` resolves identity from the sender the platform names.** `_actor` fell back to the
+  session map — "whoever spoke last in this session" — when the sender had no roster row. In a shared
+  session (`group_sessions_per_user: false`, the household setup) that is frequently the owner, so an
+  unrostered sender the gateway let in could `/many approve CODE` (answering parked asks),
+  `/many pause` enforcement and `/many invite owner`. A named sender now resolves roster row →
+  attested local seat → **guest**; the session map answers only for a source that carries no sender.
+- **The operator's own terminal works in `/many` too.** The same function never applied
+  `identity.is_local_seat`, so `platform="cli"` + this machine's `uid:<uid>` was treated as an
+  unknown guest by every command. It now matches `pre_llm_call`, including `local_seat_policy: roster`.
+- **A bare `/many approve` is a listing, and listings are gated.** It printed every pending code plus
+  each asker's tool arguments to whoever typed it. The owner reads the queue; anybody else sees only
+  the asks that are theirs (code + tool), and nothing at all when nothing of theirs is waiting.
+- **The same question asked of the neighbours.** `/many audit` with no name read the whole
+  household's trail; `/many roster` printed every platform id; an unrostered sender got both. Now:
+  owners read the house, members read themselves, and a stranger is told they are not on the roster.
+  This matches the rule the `manyhands_people` tool already applied.
+- 59 tests (+4), plus `tests/probe_command_actor.py`, which reproduces both findings against any
+  checkout (`ESCALATED`/`LEAKED` at `5976905b`, `BLOCKED`/`PRIVATE` here) and a `/many` section in
+  `tests/live_integration.py` that drives the real `invoke_plugin_command(…, source=SessionSource(…))`
+  boundary the gateway uses.
+
 ## 0.3.1 — a machine marker is not a role
 
 Found in catalog review: `pre_llm_call` decided "the host is talking to itself" from the message text
