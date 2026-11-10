@@ -431,9 +431,22 @@ def register(ctx) -> None:
 
     def _handler(fn):
         def handle(
-            args: dict[str, Any], session_id: str = "", turn_id: str = "", **kwargs: Any
+            args: dict[str, Any],
+            session_id: str = "",
+            turn_id: str = "",
+            task_id: str = "",
+            **kwargs: Any,
         ) -> str:
-            return fn(runtime, args if isinstance(args, dict) else {}, session_id, turn_id)
+            # The host dispatches a plugin tool with `task_id` + `session_id` and never `turn_id`
+            # (model_tools._execute_tool), so task_id is the discriminator that keeps two people in
+            # one shared session from acting as each other.
+            return fn(
+                runtime,
+                args if isinstance(args, dict) else {},
+                session_id,
+                turn_id,
+                task_id,
+            )
 
         return handle
 

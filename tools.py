@@ -16,15 +16,28 @@ def _ok(**payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, default=str)
 
 
-def _caller(rt, session_id: str, turn_id: str = "") -> dict[str, Any]:
+def _caller(
+    rt, session_id: str, turn_id: str = "", task_id: str = ""
+) -> dict[str, Any]:
     """Who is calling this tool.
 
-    Tool dispatch carries no sender identity, so this resolves the same way ``pre_tool_call`` does:
-    the turn's map, then the session's, then the database, then fail closed as an unidentified guest.
+    Tool dispatch carries no sender identity: ``tools/registry.py`` passes ``task_id`` + ``session_id``
+    (never ``turn_id``), so this resolves turn map -> task map -> session -> fail closed. The session
+    fallback is only used when one person has ever spoken there; in a shared session an unattributable
+    call comes back as an unidentified guest rather than borrowing the last speaker's identity.
     """
-    person, _ = rt.person_for_session(session_id or "", turn_id or "")
+    person, source = rt.person_for_session(session_id or "", turn_id or "", task_id or "")
     if person is None:
-        return {"person_id": None, "role": policy.GUEST, "tools": [], "display": "unknown session"}
+        return {
+            "person_id": None,
+            "role": policy.GUEST,
+            "tools": [],
+            "display": (
+                "a shared session with more than one speaker"
+                if source == "ambiguous"
+                else "unknown session"
+            ),
+        }
     return person
 
 
@@ -35,9 +48,9 @@ def _is_owner(person: dict[str, Any]) -> bool:
 # --------------------------------------------------------------------------- whoami
 
 
-def whoami(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def whoami(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id, turn_id)
+        person = _caller(rt, session_id, turn_id, task_id)
         role = policy.normalize_role(person.get("role"))
         card = policy.tool_card(role, person.get("tools"))
         pid = person.get("person_id")
@@ -65,10 +78,10 @@ def whoami(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") ->
 # --------------------------------------------------------------------------- people
 
 
-def people(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def people(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
         conn = rt.conn
-        caller = _caller(rt, session_id, turn_id)
+        caller = _caller(rt, session_id, turn_id, task_id)
         viewer_is_owner = _is_owner(caller)
         action = str(args.get("action") or "list").strip().lower()
 
@@ -177,9 +190,9 @@ def people(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") ->
 # --------------------------------------------------------------------------- memory
 
 
-def remember(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def remember(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id, turn_id)
+        person = _caller(rt, session_id, turn_id, task_id)
         pid = person.get("person_id")
         text = str(args.get("text") or "").strip()
         if not text:
@@ -197,9 +210,9 @@ def remember(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") 
         return _err(f"remember failed: {exc.__class__.__name__}: {exc}")
 
 
-def recall(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def recall(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id, turn_id)
+        person = _caller(rt, session_id, turn_id, task_id)
         pid = person.get("person_id")
         if not pid or pid == identity.OPERATOR:
             return _ok(results=[], note="no person attached to this conversation")
@@ -228,9 +241,9 @@ def recall(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") ->
         return _err(f"recall failed: {exc.__class__.__name__}: {exc}")
 
 
-def share(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def share(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
-        person = _caller(rt, session_id, turn_id)
+        person = _caller(rt, session_id, turn_id, task_id)
         role = policy.normalize_role(person.get("role"))
         if role not in (policy.OWNER, policy.MEMBER):
             return _err(f"a {role} cannot publish shared facts — ask the owner")
@@ -248,9 +261,9 @@ def share(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> 
 # --------------------------------------------------------------------------- audit
 
 
-def audit(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "") -> str:
+def audit(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
     try:
-        caller = _caller(rt, session_id, turn_id)
+        caller = _caller(rt, session_id, turn_id, task_id)
         target = str(args.get("person") or "").strip()
         hours = float(args.get("hours") or 24)
         limit = max(1, min(int(args.get("limit") or 25), 100))

@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.5.0 — a tool call belongs to whoever asked for it
+
+Found while re-reading the tool path after the 0.4.0 command fix, on `30fa4f0`. The gate was right;
+the **tool handlers** were not.
+
+- **A tool handler is dispatched with `task_id`, never `turn_id`.** `model_tools._execute_tool` builds
+  `dispatch_kwargs = {"task_id": ids.task_id, "session_id": ids.session_id}` and `tools/registry.py`
+  narrows it to the handler's own signature, so `tools._caller` fell back to the session map — the
+  last person whose turn started in that session. Two people in one shared session
+  (`group_sessions_per_user: false`) whose turns interleave therefore got each other's identity on
+  every tool call: a member's own `manyhands_recall` answered with the owner's private note, and
+  `manyhands_share` sat open to a guest who happened to speak before the owner.
+  `Runtime.remember` now records `task_id -> person_id` alongside the turn map (both bounded), and
+  `person_for_session` resolves turn → task → session.
+- **The session fallback is now conditional.** It is trusted only when exactly one person has ever
+  spoken in the session (`store.session_person_count`, backed by a new `session_people` table, created
+  with `IF NOT EXISTS` so an existing database upgrades in place). In a shared session an
+  unattributable call is an unidentified guest and the refusal says "a shared session with more than
+  one speaker" instead of blaming the asker's role.
+- **The `llm_request` middleware withholds instead of failing open** on an unattributable request in a
+  shared session — the one case where guessing which speaker a prompt belongs to hands somebody the
+  operator's notes. Unknown sessions are still left alone.
+- 63 tests (+4), `tests/probe_tool_identity.py` reproduces both halves against any checkout
+  (`WRONG SPEAKER`/`LEAKED` at 0.4.0, `ATTRIBUTED`/`PRIVATE` here), and `tests/live_integration.py`
+  now proves it through the real `tools.registry.dispatch`: in a session whose last speaker is the
+  guest, the dispatch carrying `task_id` resolves to the real caller and the one without fails closed.
+
 ## 0.4.0 — a command belongs to whoever typed it
 
 Found in the second catalog review, on `5976905`. The turn path was already correct; the **slash

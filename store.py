@@ -90,6 +90,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at REAL
 );
 
+-- Every distinct person who has spoken in a session. `sessions` keeps only the last speaker (for
+-- copy and the audit trail); this table is what distinguishes a one-person session from a shared one,
+-- so a call that carries no turn/task identity in a shared session can fail closed instead of
+-- borrowing the last speaker's role and memory namespace.
+CREATE TABLE IF NOT EXISTS session_people (
+  session_id TEXT NOT NULL,
+  person_id  TEXT NOT NULL,
+  first_seen REAL,
+  last_seen  REAL,
+  PRIMARY KEY (session_id, person_id)
+);
+
 CREATE TABLE IF NOT EXISTS invites (
   code       TEXT PRIMARY KEY,
   role       TEXT NOT NULL DEFAULT 'member',
@@ -444,14 +456,37 @@ def remember_session(
 ) -> None:
     if not session_id:
         return
+    ts = now()
     conn.execute(
         """INSERT INTO sessions (session_id, person_id, platform, updated_at) VALUES (?, ?, ?, ?)
            ON CONFLICT(session_id) DO UPDATE SET
              person_id = excluded.person_id, platform = excluded.platform,
              updated_at = excluded.updated_at""",
-        (session_id, person_id, platform, now()),
+        (session_id, person_id, platform, ts),
     )
+    try:
+        conn.execute(
+            """INSERT INTO session_people (session_id, person_id, first_seen, last_seen)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(session_id, person_id) DO UPDATE SET last_seen = excluded.last_seen""",
+            (session_id, person_id, ts, ts),
+        )
+    except sqlite3.Error:
+        pass  # the last-speaker row above is the fallback an older database still has
     conn.commit()
+
+
+def session_person_count(conn: sqlite3.Connection, session_id: str) -> int:
+    """How many distinct people have spoken in this session (0 when it is unknown)."""
+    if not session_id:
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) AS n FROM session_people WHERE session_id = ?", (session_id,)
+        ).fetchone()
+    except sqlite3.Error:
+        return 0  # pre-session_people database: cannot tell, so never claim it is shared
+    return int(row["n"] if row else 0)
 
 
 def person_for_session(conn: sqlite3.Connection, session_id: str) -> str | None:

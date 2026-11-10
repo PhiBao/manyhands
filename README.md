@@ -36,7 +36,7 @@ Nothing leaves the machine. No network calls, no third-party dependencies, stand
 
 ```bash
 git clone https://github.com/PhiBao/manyhands && cd manyhands
-python3 tests/selftest.py        # 59 tests, ~14 s, standard library only
+python3 tests/selftest.py        # 63 tests, ~14 s, standard library only
 ```
 
 That is the whole core loop, checked without Hermes, a bot token or a model key: a stranger refused,
@@ -273,6 +273,18 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
     trail unless you are the owner, `/many roster` shows platform ids to the owner only, and somebody
     who is not on the roster gets neither
     (`test_the_house_wide_trail_and_the_platform_ids_are_owner_only`).
+18. **A tool call is attributed by `task_id`, and a shared session refuses to guess.** The tool path
+    is not the hook path: the host dispatches a plugin tool with `task_id` + `session_id` and never
+    `turn_id`, so the session row ("whoever spoke last") is not evidence. With the caller's task_id
+    the call is the caller — a member's own `manyhands_recall` in a session the owner also spoke in
+    returns the member's facts and nothing of the owner's
+    (`test_a_members_tool_call_in_a_shared_session_acts_as_the_member`). With no turn or task
+    identity in a session more than one person has spoken in, the call is an unidentified guest and
+    says so, rather than borrowing a neighbour's role, memory namespace and tools
+    (`test_an_unattributable_tool_call_in_a_shared_session_fails_closed`). The same rule makes the
+    `llm_request` middleware **withhold** the operator's memory on an unattributable request in a
+    shared session instead of failing open
+    (`test_an_unattributable_request_in_a_shared_session_is_withheld_not_failed_open`).
 
 ## How the pieces fit (the four gotchas that shaped it)
 
@@ -280,11 +292,21 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
 tool_call_id, turn_id, api_request_id, middleware_trace`
 (`hermes_cli/plugins.py:1907`, the `_PreToolCallDirective` gate). `pre_llm_call` is the only hook that
 receives `sender_id` + `platform` (`agent/turn_context.py`). So identity is carried across in a map
-written on every turn, keyed on **`turn_id` first** and persisted per session in SQLite so a restart
-does not lose it. Turn-first matters: with a session-only key, two people in one shared chat session
-would be attributed to whoever spoke last, and one person's tool call would be judged against the
-other's role. When the turn map, the session map and the database all come up empty, the call fails
-closed.
+written on every turn, keyed on **`turn_id` first**, then **`task_id`**, and persisted per session in
+SQLite so a restart does not lose it. Both keys matter: with a session-only key, two people in one
+shared chat session would be attributed to whoever spoke last, and one person's call would be judged
+against the other's role.
+
+**A tool handler gets `task_id`, never `turn_id`.** `model_tools._execute_tool` builds
+`dispatch_kwargs = {"task_id": ids.task_id, "session_id": ids.session_id}` and `tools/registry.py`
+narrows that to what the handler declares, so `turn_id` never reaches `manyhands_remember`. `task_id`
+is `effective_task_id` — a fresh uuid per turn unless the caller supplied one — and it *is* handed to
+`pre_llm_call` and to the tool call, which makes it the discriminator for the tool path. The session
+map is used only when exactly one person has ever spoken in that session
+(`store.session_person_count`); otherwise the call fails closed as an unidentified guest instead of
+acting as its neighbour. `tests/probe_tool_identity.py` reproduces the alternative against any
+checkout: at 0.4.0 a member's own `manyhands_recall` in a shared session answered with the owner's
+private note.
 
 **The host's approval transport does not know who asked, and a plugin escalation never reaches it.**
 A transport receives a redacted `ApprovalRequest` (`hermes_cli/approval_transport.py`) — command,
@@ -347,6 +369,11 @@ not an estimate. 0 means unlimited.
   non-owners rather than rewritten per person, and an external memory provider's block (a different
   renderer) is not stripped. Registering a per-person provider is the natural v2.
 - **The token budget is per UTC day**, and a single long turn can overshoot before the next check.
+- **In a shared session, a tool call the host cannot attribute is refused, not guessed.** Hermes
+  dispatches a plugin tool with `task_id` + `session_id` and never `turn_id`. Normally the task map
+  names the caller; if a future host stops sending `task_id` (or a caller strips it), `remember` and
+  `recall` answer "there is no person attached to this conversation" in any session more than one
+  person has spoken in, instead of acting as whoever spoke last. Single-person sessions are unaffected.
 - **`/many approve` is only as strong as the platform's identity.** If an attacker controls the
   owner's chat account, they are the owner.
 - **A guest can still read anything the *model* says.** Refusing a tool is not the same as refusing a
@@ -368,8 +395,9 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 59 tests, stdlib unittest, no Hermes install
-python3 tests/probe_command_actor.py                          # the two /many findings, this tree vs. any sha
+python3 tests/selftest.py                                    # 63 tests, stdlib unittest, no Hermes install
+python3 tests/probe_command_actor.py                          # /many identity + listing, this tree vs. any sha
+python3 tests/probe_tool_identity.py                          # tool-call identity, this tree vs. any sha
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
 ~/.hermes/hermes-agent/venv/bin/python tests/live_integration.py   # loads the plugin in the real host
 hermes plugins validate ./                                   # the catalog CI gate
@@ -391,8 +419,9 @@ owner; per-person memory never leaking; shared facts visible to all; machine-gen
 identity resolution; pause dropping enforcement but keeping the person card; the audit counting
 turns/tools/refusals/tokens; an unrostered sender in a session whose last speaker was the owner kept
 out of `/many approve`/`pause`/`invite`; a bare `/many approve` listing only the caller's own ask;
-the house-wide trail and the platform ids staying with the owner; and the daily budget blocking the
-next turn.
+the house-wide trail and the platform ids staying with the owner; a member's own tool call in a shared
+session staying theirs while an unattributable one fails closed instead of borrowing the last speaker;
+and the daily budget blocking the next turn.
 
 `tests/live_integration.py` is the half that unit tests cannot prove: it copies the plugin into a
 throwaway `HERMES_HOME`, loads it through the **real** `PluginManager`, and drives the host's own
@@ -412,6 +441,8 @@ llm_request mw     member: memory withheld + card injected; owner: untouched
 no gateway         deny in 0.0 s   no answer  deny at 5.0 s   prompt → telegram:111 (owner)
 /many as a stranger in the owner's session: approve/pause/invite all "only the owner"
 bare /many approve: stranger "nothing of yours", asker sees their code, owner sees code + args
+tool dispatch in that session: last speaker telegram:333, with task_id → telegram:111 (the caller),
+                                with no task identity → null (fail closed)
 LIVE INTEGRATION: PASS
 ```
 

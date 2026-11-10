@@ -51,6 +51,7 @@ class Runtime:
         self._conn = None
         self._hot: dict[str, str] = {}
         self._hot_turn: dict[str, str] = {}
+        self._hot_task: dict[str, str] = {}
         self._override_path = Path(db_path) if db_path else None
         key = ""
         for attr in ("plugin_id", "name"):
@@ -135,19 +136,34 @@ class Runtime:
     # ------------------------------------------------------------------ session map
 
     def remember(
-        self, session_id: str, person_id: str, platform: str | None = None, turn_id: str = ""
+        self,
+        session_id: str,
+        person_id: str,
+        platform: str | None = None,
+        turn_id: str = "",
+        task_id: str = "",
     ) -> None:
-        """Record who is speaking — on the TURN first, and on the session as a fallback.
+        """Record who is speaking — on the TURN first, then the TASK, and on the session as a fallback.
 
-        Both hooks receive ``turn_id`` for the same turn, but a session can be shared by several
-        people (``group_sessions_per_user: false``). Keyed on the session alone, two people in one
-        chat would be attributed to whoever spoke last; keyed on the turn, they cannot collide.
+        All three hooks receive ``turn_id`` for the same turn, but a **tool handler** does not:
+        ``tools/registry.py`` dispatches with ``task_id`` + ``session_id`` only (see
+        ``model_tools._execute_tool``), so a tool that resolved on the session map alone would act as
+        whoever spoke most recently in that session. ``task_id`` is the per-turn value the host hands
+        to both the turn hook and the tool call (``effective_task_id`` — a fresh uuid per turn unless
+        the caller supplied one), so it is the discriminator the tool path needs.
+
+        Both maps are bounded: a long-lived gateway must not leak turns.
         """
         if turn_id:
             self._hot_turn[turn_id] = person_id
-            if len(self._hot_turn) > 512:  # bounded: a long-lived gateway must not leak turns
+            if len(self._hot_turn) > 512:
                 for stale in list(self._hot_turn)[:256]:
                     self._hot_turn.pop(stale, None)
+        if task_id:
+            self._hot_task[task_id] = person_id
+            if len(self._hot_task) > 512:
+                for stale in list(self._hot_task)[:256]:
+                    self._hot_task.pop(stale, None)
         if not session_id:
             return
         self._hot[session_id] = person_id
@@ -160,16 +176,34 @@ class Runtime:
         self._hot.pop(session_id, None)
 
     def person_for_session(
-        self, session_id: str, turn_id: str = ""
+        self, session_id: str, turn_id: str = "", task_id: str = ""
     ) -> tuple[dict[str, Any] | None, str]:
-        """Resolve the person for a tool call: turn map -> session map -> database -> unknown."""
+        """Resolve the person for a tool or hook call: turn map -> task map -> session -> unknown.
+
+        The session fallback is only trusted when exactly one person has ever spoken in that session.
+        In a shared session (``group_sessions_per_user: false``) the session row is *whoever spoke
+        last*, which is the other person's identity for anyone whose own turn did not supply a
+        ``turn_id``/``task_id`` — so an unattributable call in a shared session fails closed instead
+        of borrowing a neighbour's role, memory namespace and tools.
+        """
         if turn_id:
             pid = self._hot_turn.get(turn_id)
             if pid:
                 return identity._load(self.conn, pid), "turn"
-        return identity.person_for_tool_call(
+        if task_id:
+            pid = self._hot_task.get(task_id)
+            if pid:
+                return identity._load(self.conn, pid), "task"
+        person, how = identity.person_for_tool_call(
             self.conn, session_id=session_id, hot_map=self._hot
         )
+        if person is not None:
+            try:
+                if store.session_person_count(self.conn, session_id) > 1:
+                    return None, "ambiguous"
+            except Exception:
+                pass
+        return person, how
 
     # ------------------------------------------------------------------ outbound
 

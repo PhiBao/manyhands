@@ -16,6 +16,7 @@ is why this is a plain script with its own runner rather than a pytest module.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -108,23 +109,30 @@ def seed_roster(rt, *, owner="111", member="222", guest="333", extra=None):
         store.add_person(conn, platform=platform, sender_id=sender, role=role, name=name)
 
 
-def turn(rt, *, sender="222", message="hello", session="s1", platform="telegram"):
+def turn(rt, *, sender="222", message="hello", session="s1", platform="telegram", task=""):
     hook = hooks.make_pre_llm_call(rt)
     return hook(
         user_message=message,
         session_id=session,
         turn_id=f"t-{time.time_ns()}",
+        task_id=task,
         platform=platform,
         sender_id=sender,
     )
 
 
-def call_tool(rt, name, *, session="s1", **kwargs):
+def call_tool(rt, name, *, session="s1", task="", **kwargs):
     spec = {"args": kwargs}
     handler = getattr(tools, {"manyhands_whoami": "whoami", "manyhands_people": "people",
                               "manyhands_remember": "remember", "manyhands_recall": "recall",
                               "manyhands_share": "share", "manyhands_audit": "audit"}[name])
-    return handler(rt, spec["args"], session)
+    # the host dispatches a plugin tool with task_id + session_id and never turn_id
+    try:
+        return handler(rt, spec["args"], session_id=session, task_id=task)
+    except TypeError:
+        # an older build whose handler has no task_id: the kwarg is dropped, which is exactly the
+        # session-map fallback these tests exist to rule out
+        return handler(rt, spec["args"], session_id=session)
 
 
 # ============================================================== tests
@@ -814,6 +822,62 @@ class SharedSession(unittest.TestCase):
         self.assertIn("/many approve", escalated.get("message", ""))
 
 
+class ToolIdentity(unittest.TestCase):
+    """A tool handler is dispatched with `task_id`, never `turn_id` — so that is the map it uses."""
+
+    def test_a_members_tool_call_in_a_shared_session_acts_as_the_member(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        shared = "household-chat"
+        # the owner's own private note, stored on the operator's turn
+        turn(rt, sender="111", session="owner-dm", task="own")
+        stored = json.loads(
+            call_tool(rt, "manyhands_remember", session="owner-dm", task="own",
+                      text="passport expires in March", topic="personal")
+        )
+        self.assertTrue(stored.get("saved"), stored)
+        # two people, one session, turns interleaved: Minh's turn starts, then Kiter's, then Minh's
+        # own tool call arrives — dispatched with Minh's task_id
+        turn(rt, sender="222", session=shared, task="task-minh")
+        turn(rt, sender="111", session=shared, task="task-kiter")
+        who = json.loads(call_tool(rt, "manyhands_whoami", session=shared, task="task-minh"))
+        self.assertEqual(who["person_id"], "telegram:222")
+        self.assertEqual(who["role"], "member")
+        got = json.loads(
+            call_tool(rt, "manyhands_recall", session=shared, task="task-minh", query="passport")
+        )
+        self.assertEqual(got["results"], [], "the owner's own note must never answer a member's recall")
+        # and the owner's own call in the same session still gets their own note back
+        mine = json.loads(
+            call_tool(rt, "manyhands_recall", session=shared, task="task-kiter", query="passport")
+        )
+        self.assertEqual(len(mine["results"]), 1)
+        self.assertIn("passport", mine["results"][0]["text"])
+
+    def test_an_unattributable_tool_call_in_a_shared_session_fails_closed(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        shared = "household-chat"
+        turn(rt, sender="222", session=shared, task="a")
+        turn(rt, sender="111", session=shared, task="b")
+        # no task_id and no turn_id: the session row says Kiter, which is not evidence of anything
+        who = json.loads(call_tool(rt, "manyhands_whoami", session=shared))
+        self.assertIsNone(who["person_id"])
+        self.assertEqual(who["role"], "guest")
+        self.assertIn("shared session", who["person"])
+        blocked = json.loads(
+            call_tool(rt, "manyhands_share", session=shared, text="everyone should see this")
+        )
+        self.assertIn("error", blocked, "a guest cannot publish to everybody")
+
+    def test_a_one_person_session_still_resolves_without_a_task_id(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="just-minh", task="x")
+        who = json.loads(call_tool(rt, "manyhands_whoami", session="just-minh"))
+        self.assertEqual(who["person_id"], "telegram:222")
+
+
 class ThreeStates(unittest.TestCase):
     def test_a_member_is_escalated_rather_than_refused(self):
         decision = policy.decide(role="member", tool="terminal")
@@ -910,6 +974,20 @@ class HostMemoryScoping(unittest.TestCase):
         out = middleware.make_llm_request_middleware(rt)(
             request=self._request(), session_id="nobody", turn_id="nobody")
         self.assertIsNone(out)
+
+    def test_an_unattributable_request_in_a_shared_session_is_withheld_not_failed_open(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="shared-mw", task="a")
+        turn(rt, sender="111", session="shared-mw", task="b")
+        # no turn_id, no task_id: the session says Kiter, which is not evidence of who is asking
+        out = middleware.make_llm_request_middleware(rt)(
+            request=self._request(), session_id="shared-mw"
+        )
+        self.assertIsInstance(out, dict, "the host's own memory is withheld rather than fail open")
+        system = out["request"]["messages"][0]["content"]
+        self.assertNotIn("never share the door code", system)
+        self.assertNotIn("USER PROFILE", system)
 
     def test_junk_in_never_raises(self):
         rt = new_runtime()

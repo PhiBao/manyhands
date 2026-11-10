@@ -88,6 +88,9 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     user_message = kwargs.get("user_message") or ""
     session_id = str(kwargs.get("session_id") or "")
     turn_id = str(kwargs.get("turn_id") or "")
+    # The per-turn discriminator the tool path also receives (tools/registry.py dispatches with
+    # task_id + session_id, never turn_id), so the map the tools resolve through is written here.
+    task_id = str(kwargs.get("task_id") or "")
     platform = str(kwargs.get("platform") or "")
     sender_id = str(kwargs.get("sender_id") or "")
     # The platform's own display name, so the owner's approval prompt says "Haruki wants terminal"
@@ -105,7 +108,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     #    attribute is resolved as that sender, whatever its first characters are.
     marked = identity.is_machine_turn(user_message)
     if marked and not sender_id:
-        rt.remember(session_id, identity.OPERATOR, platform or "host", turn_id=turn_id)
+        rt.remember(session_id, identity.OPERATOR, platform or "host", turn_id=turn_id, task_id=task_id)
         rt.audit(
             kind="turn",
             person_id=identity.OPERATOR,
@@ -131,7 +134,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     #    rather than typed: see identity.is_local_seat. `local_seat_policy: roster` opts out.
     if sender_id and str(rt.setting("local_seat_policy", "operator")).lower() != "roster":
         if identity.is_local_seat(platform, sender_id):
-            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id)
+            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id, task_id=task_id)
             rt.audit(
                 kind="turn",
                 person_id=identity.OPERATOR,
@@ -161,7 +164,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
     if person is None:
         if refusal is None:
             # No identity on the event at all: the local CLI seat, which is the operator's own.
-            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id)
+            rt.remember(session_id, identity.OPERATOR, platform or "cli", turn_id=turn_id, task_id=task_id)
             return None
         rt.audit(
             kind="refusal",
@@ -173,7 +176,7 @@ def _pre_llm_call(rt: Runtime, **kwargs: Any) -> dict[str, Any] | None:
         return {"action": "block", "message": refusal}
 
     pid = person["person_id"]
-    rt.remember(session_id, pid, platform, turn_id=turn_id)
+    rt.remember(session_id, pid, platform, turn_id=turn_id, task_id=task_id)
 
     # 4. Daily budget (0 = unlimited). Tokens are counted from post_api_request, not estimated.
     cap = int(person.get("daily_tokens") or 0)

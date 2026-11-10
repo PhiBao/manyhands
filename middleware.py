@@ -209,6 +209,7 @@ def make_llm_request_middleware(rt):
         original_request: Any = None,
         session_id: str = "",
         turn_id: str = "",
+        task_id: str = "",
         platform: str = "",
         **kwargs: Any,
     ):
@@ -217,9 +218,22 @@ def make_llm_request_middleware(rt):
                 return None
             if not bool(rt.setting("scope_host_memory", True)):
                 return None
-            person, _source = rt.person_for_session(session_id or "", turn_id or "")
+            person, source = rt.person_for_session(
+                session_id or "", turn_id or "", task_id or ""
+            )
             if person is None:
-                return None  # unknown session: leave the host's own request alone
+                if source != "ambiguous":
+                    return None  # unknown session: leave the host's own request alone
+                # Several people have spoken in this session and this request carries no turn/task
+                # identity, so there is no "not the owner" to prove. Withhold rather than fail open:
+                # an unidentified request in a shared session is the one case where guessing hands
+                # somebody the operator's own notes.
+                person = {
+                    "person_id": None,
+                    "role": policy.GUEST,
+                    "tools": [],
+                    "display": "an unidentified speaker in a shared session",
+                }
             if str(person.get("person_id")) == identity.OPERATOR:
                 return None  # the host talking to itself
             if policy.normalize_role(person.get("role")) == policy.OWNER:

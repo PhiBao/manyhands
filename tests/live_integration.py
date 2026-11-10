@@ -334,6 +334,25 @@ out["cmd_owner_bare_approve"] = as_command("approve", "111", shared_live)
 out["cmd_owner_pause"] = as_command("pause", "111", shared_live)
 out["cmd_owner_resume"] = as_command("resume", "111", shared_live)
 
+# 6 — the real tool dispatch in that same shared session. The host hands a plugin tool `task_id` +
+# `session_id` and never `turn_id` (`model_tools._execute_tool` builds exactly those dispatch_kwargs),
+# so the task map is what keeps two people in one session from acting as each other: with the
+# member's task_id the call is the member, without any task identity it fails closed rather than
+# borrowing the last speaker.
+invoke_hook(
+    "pre_llm_call", session_id=shared_live, task_id="t9", turn_id="turn-9",
+    user_message="hi", conversation_history=[], is_first_turn=True,
+    model="probe", platform="telegram", parent_session_id=None, sender_id="333",
+)
+out["household_people"] = store.session_person_count(rt.conn, shared_live)
+out["household_last_speaker_now"] = store.person_for_session(rt.conn, shared_live)
+out["tool_with_task"] = json.loads(
+    registry.dispatch("manyhands_whoami", {}, session_id=shared_live, task_id="t8")
+).get("person_id")
+out["tool_without_task"] = json.loads(
+    registry.dispatch("manyhands_whoami", {}, session_id=shared_live)
+).get("person_id")
+
 print(json.dumps(out, indent=2, default=str))
 print("\naudit:", store.audit_summary(rt.conn, hours=1))
 
@@ -375,6 +394,11 @@ ok = (
     and "id_rsa" in out["cmd_owner_bare_approve"]
     and "paused" in out["cmd_owner_pause"]                # and the owner still owns it
     and "back on" in out["cmd_owner_resume"]
+    and out["household_people"] >= 2                      # more than one person has spoken in it
+    and out["household_last_speaker_now"] == "telegram:333"   # the session row says the guest…
+    and out["tool_with_task"] == "telegram:111"           # …the task map names the real speaker…
+    and out["tool_without_task"] is None                  # …and with no task identity, fail closed
+    and rt.person_for_session(shared_live)[1] == "ambiguous"
     and out["middleware_member_changed"]
     and out["middleware_member_memory_withheld"]
     and out["middleware_member_card_injected"]
