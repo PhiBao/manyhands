@@ -286,6 +286,19 @@ rt.dm = real_dm
 out["whoami_via_registry"] = json.loads(
     registry.dispatch("manyhands_whoami", {}, session_id="sess-minh")
 )
+# …and the roster tool through that same registry, in an OWNER turn: a model-driven roster write must
+# be refused by the handler itself, not just absent from the schema
+out["roster_write_via_registry"] = str(
+    json.loads(
+        registry.dispatch(
+            "manyhands_people",
+            {"action": "add", "platform": "telegram", "sender_id": "999", "role": "owner"},
+            session_id="sess-owner",
+            task_id="t3",
+        )
+    ).get("error", "")
+)
+out["roster_unchanged_999"] = store.get_person_by_sender(rt.conn, "telegram", "999") is None
 
 # 5 — the real `/many` boundary. The gateway dispatches a plugin command through
 # `invoke_plugin_command(handler, raw_args, source=SessionSource(...), session_id=...)`, which is the
@@ -374,6 +387,8 @@ ok = (
     and out["no_answer_decision"] == "deny"
     and out["owner_dm_to"] == "telegram:111"
     and out["whoami_via_registry"]["role"] == "member"
+    and "read-only" in out["roster_write_via_registry"]   # the model cannot grant owner, even here
+    and out["roster_unchanged_999"]                       # …and nothing was added
     and out["shared_session_guest_terminal"] == "block"
     and out["shared_session_guest_web"] is None
     and out["spoof_turn_blocked"] is False       # a guest is resolved, not refused, by the marker

@@ -36,7 +36,7 @@ Nothing leaves the machine. No network calls, no third-party dependencies, stand
 
 ```bash
 git clone https://github.com/PhiBao/manyhands && cd manyhands
-python3 tests/selftest.py        # 64 tests, ~15 s, standard library only
+python3 tests/selftest.py        # 68 tests, ~15 s, standard library only
 ```
 
 That is the whole core loop, checked without Hermes, a bot token or a model key: a stranger refused,
@@ -88,7 +88,7 @@ conversation does not exist in the marketplace.**
 | Surface | Name | What it does |
 |---|---|---|
 | tool | `manyhands_whoami` | the caller's name, role, exact tool list, fact count |
-| tool | `manyhands_people` | the roster; `add`/`role`/`tools`/`remove` are owner-only |
+| tool | `manyhands_people` | the roster, **read-only**: names, roles, tool counts. Roster changes are human-typed `/many` verbs |
 | tool | `manyhands_remember` | write a fact into the **caller's own** namespace |
 | tool | `manyhands_recall` | search the caller's facts + shared facts |
 | tool | `manyhands_share` | publish a fact to everyone (owner/member) |
@@ -98,7 +98,7 @@ conversation does not exist in the marketplace.**
 | hook | `post_api_request` | attribute token usage to whoever owns the turn |
 | middleware | `llm_request` | withhold the operator's own MEMORY/USER blocks from a non-owner's system prompt, and put the person card where it belongs (the system prompt) |
 | transport | `manyhands` | dangerous-command prompts to the **owner's DM** under a short code (plugin escalations are parked and DM'd by the hook itself) |
-| command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · role <name> <role> · tools <name> [add\|remove] <tool…> · remove <name> · pause · resume · approve [code] · deny <code>` — a bare `approve` lists the queue, and only to the owner |
+| command | `/many` | `whoami · roster · audit [name] [hours] · invite [role] · claim [code] · add <platform> <sender_id> [role] · role <name> <role> · tools <name> [add\|remove] <tool…> · budget <name> <tokens> · remove <name> · pause · resume · approve [code] · deny <code>` — a bare `approve` lists the queue, and only to the owner |
 
 Tested on **Hermes Agent v0.23.0** (`2bd378ed`), Linux.
 
@@ -236,9 +236,17 @@ These are rules, not intentions. Each one has a test that fails if it stops bein
    host's `MEMORY`/`USER PROFILE` blocks out of a non-owner's system prompt
    (`test_the_operators_memory_is_withheld_from_a_member`, and for the owner's own prompt
    `test_the_owners_own_prompt_is_left_alone`).
-12. **Only a human can approve.** `/many approve CODE` is a slash command on the owner's own message;
-   there is no tool, hook or prompt path that can approve an escalation. An agent cannot talk itself
-   into permission.
+12. **Only a human can approve — and only a human can change the roster.** `/many approve CODE` is a
+   slash command on the owner's own message; there is no tool, hook or prompt path that can approve an
+   escalation. An agent cannot talk itself into permission. The same holds for the roster:
+   `manyhands_people` is **read-only**, so the model cannot add a person, promote one, hand out a tool
+   or a budget, or remove anybody — `add`, `role`, `tools`, `budget` and `remove` are owner-typed
+   `/many` verbs. A tool action would otherwise run on the model's say-so inside whatever turn it is
+   (an owner turn, a cron turn, a machine turn) with no human in the loop, so a prompt injection in the
+   owner's own turn could have added an outside sender **as owner**
+   (`test_the_people_tool_cannot_change_the_roster_even_in_an_owner_turn`, which tries
+   `add role=owner`, `role <guest> owner`, `tools`, and `remove` in one owner turn and asserts the
+   roster did not move).
 13. **A machine turn is a marker AND no sender.** A cron prompt arrives with no sender at all, is
     recorded as the operator and is not policed — otherwise the plugin would lock the owner out of
     their own scheduled jobs (`test_machine_generated_turn_skips_identity_resolution`). A marker
@@ -398,7 +406,7 @@ not an estimate. 0 means unlimited.
 ## Tests
 
 ```bash
-python3 tests/selftest.py                                    # 64 tests, stdlib unittest, no Hermes install
+python3 tests/selftest.py                                    # 68 tests, stdlib unittest, no Hermes install
 python3 tests/probe_command_actor.py                          # /many identity + listing, this tree vs. any sha
 python3 tests/probe_tool_identity.py                          # tool-call identity, this tree vs. any sha
 python3 tests/bench_hooks.py 500                             # what the hooks cost per turn
@@ -422,7 +430,8 @@ owner; per-person memory never leaking; shared facts visible to all; machine-gen
 identity resolution; pause dropping enforcement but keeping the person card; the audit counting
 turns/tools/refusals/tokens; an unrostered sender in a session whose last speaker was the owner kept
 out of `/many approve`/`pause`/`invite`; a bare `/many approve` listing only the caller's own ask;
-the house-wide trail and the platform ids staying with the owner; a member's own tool call in a shared
+the house-wide trail and the platform ids staying with the owner; the roster staying read-only to the
+model in an owner turn (add/promote/tools/remove all refused, nothing moved); a member's own tool call in a shared
 session staying theirs while an unattributable one fails closed instead of borrowing the last speaker;
 and the daily budget blocking the next turn.
 
@@ -446,6 +455,7 @@ no gateway         deny in 0.0 s   no answer  deny at 5.0 s   prompt → telegra
 bare /many approve: stranger "nothing of yours", asker sees their code, owner sees code + args
 tool dispatch in that session: last speaker telegram:333, with task_id → telegram:111 (the caller),
                                 with no task identity → null (fail closed)
+roster tool in an owner turn:  "manyhands_people is read-only …" and telegram:999 was never added
 LIVE INTEGRATION: PASS
 ```
 

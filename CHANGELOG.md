@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.0 — the model cannot change the roster
+
+Third catalog review, on `0a7cb42a`. Older code, and the most consequential of the rounds: the tool
+`manyhands_people` exposed `add`, `role`, `tools` and `remove`, and they ran on the model's say-so
+whenever the turn belonged to the owner or the operator (which includes cron and machine turns). No
+Hermes approval sees a plugin tool, so a prompt injection in the owner's own turn could add an outside
+sender **as owner** — every tool, and the ability to approve asks — which contradicted the README's
+"only a human can approve".
+
+- **`manyhands_people` is read-only.** The action enum is `["list"]`, and the handler refuses any other
+  action in code, not just in the schema, with a message naming the human verbs. `daily_tokens` for
+  other people is owner-only in the listing.
+- **`/many add <platform> <sender_id> [role]`** is now a real owner-typed verb, which is what the
+  `/many invite` reply had been suggesting all along (it pointed at `add`, which did not exist and fell
+  through to "unknown command"). It refuses a duplicate sender and names the role it assigned.
+- **`/many budget <name> <tokens>`** replaces the budget-setter that lived only on the removed tool
+  path, so a per-person daily cap is still reachable — by the owner, by hand.
+- 68 tests (+4). The reviewer's requested test is
+  `test_the_people_tool_cannot_change_the_roster_even_in_an_owner_turn`: one owner turn, six attempts
+  (`add role=owner`, `add` with no role, `role <guest> owner`, `role <person_id> owner`, `tools`, and
+  `remove`), every one refused, and the roster asserted unmoved — one owner, the guest still a guest,
+  no new row, nobody removed. Against 0.5.1 it fails with
+  `{'added': 'telegram:999', 'role': 'owner', 'summary': 'owner — every tool'}`.
+
 ## 0.5.1 — the tool surface gets the rule the command surface already had
 
 Found by applying 0.4.0's question to the six tools instead of just `/many`.

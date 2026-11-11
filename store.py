@@ -305,6 +305,15 @@ def set_person_tools(conn: sqlite3.Connection, person_id: str, tools: Iterable[s
     return cur.rowcount > 0
 
 
+def set_daily_tokens(conn: sqlite3.Connection, person_id: str, tokens: int) -> bool:
+    cur = conn.execute(
+        "UPDATE people SET daily_tokens = ? WHERE person_id = ?",
+        (max(0, int(tokens or 0)), person_id),
+    )
+    conn.commit()
+    return cur.rowcount > 0
+
+
 def rename_person(conn: sqlite3.Connection, person_id: str, name: str) -> bool:
     cur = conn.execute("UPDATE people SET name = ? WHERE person_id = ?", (name, person_id))
     conn.commit()
@@ -315,6 +324,10 @@ def remove_person(conn: sqlite3.Connection, person_id: str) -> bool:
     cur = conn.execute("DELETE FROM people WHERE person_id = ?", (person_id,))
     conn.execute("DELETE FROM facts WHERE person_id = ?", (person_id,))
     conn.execute("DELETE FROM sessions WHERE person_id = ?", (person_id,))
+    try:
+        conn.execute("DELETE FROM session_people WHERE person_id = ?", (person_id,))
+    except sqlite3.Error:
+        pass  # an older database without the table
     conn.commit()
     return cur.rowcount > 0
 

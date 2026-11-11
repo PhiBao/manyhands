@@ -79,110 +79,58 @@ def whoami(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", ta
 
 
 def people(rt, args: dict[str, Any], session_id: str = "", turn_id: str = "", task_id: str = "") -> str:
+    """The roster, read-only.
+
+    Roster *changes* are deliberately not a tool. A tool runs on the model's say-so inside whatever
+    turn it happens to be — an owner's turn, a cron turn, a machine turn — and nothing in Hermes asks
+    the human before it lands, so a prompt injection in an owner's turn could hand an outsider the
+    owner role and every tool that comes with it. That would undo the one thing this plugin promises:
+    permissions change when a **human types a command**. The human path is `/many add`, `/many role`,
+    `/many tools`, `/many budget` and `/many remove` (`__init__._cmd`), and it is the only path.
+    """
     try:
         conn = rt.conn
         caller = _caller(rt, session_id, turn_id, task_id)
         viewer_is_owner = _is_owner(caller)
         action = str(args.get("action") or "list").strip().lower()
 
-        if action == "list":
-            rows = store.list_people(conn)
-            return _ok(
-                count=len(rows),
-                people=[
-                    {
-                        # Only the owner sees the platform ids: a roster is a list of people, not a
-                        # directory of accounts for whoever happens to be talking to the bot.
-                        "person_id": row["person_id"] if viewer_is_owner else None,
-                        "name": row.get("name") or row.get("display") or row.get("sender_id"),
-                        "platform": row.get("platform") if viewer_is_owner else None,
-                        "role": policy.normalize_role(row.get("role")),
-                        "summary": policy.describe_role(row.get("role") or "", row.get("tools")),
-                        "facts": store.count_facts(conn, row["person_id"]),
-                        "daily_tokens": int(row.get("daily_tokens") or 0),
-                        "you": row["person_id"] == caller.get("person_id"),
-                    }
-                    for row in rows
-                ],
-                open_invites=len(store.open_invites(conn)) if viewer_is_owner else None,
-                note=None
-                if viewer_is_owner
-                else "platform ids are only shown to the owner; roles and tool counts are public "
-                "inside this chat",
-            )
-
-        if not viewer_is_owner:
+        if action not in {"", "list"}:
             return _err(
-                "only the owner can change the roster",
+                "manyhands_people is read-only: a roster change has to be typed by a human, not "
+                "requested by the model. Ask the owner to run /many add <platform> <sender_id> "
+                "[role], /many role <name> <role>, /many tools <name> … , /many budget <name> "
+                "<tokens> or /many remove <name>.",
                 you=identity.label(caller),
                 role=policy.normalize_role(caller.get("role")),
             )
 
-        if action == "add":
-            platform = str(args.get("platform") or "").strip()
-            sender = str(args.get("sender_id") or "").strip()
-            if not platform or not sender:
-                return _err("add needs platform and sender_id (e.g. platform='telegram', sender_id='12345')")
-            role = policy.normalize_role(args.get("role") or policy.GUEST)
-            person = store.add_person(
-                conn,
-                platform=platform,
-                sender_id=sender,
-                role=role,
-                name=args.get("name"),
-                tools=[str(t) for t in (args.get("tools") or [])],
-                daily_tokens=int(args.get("daily_tokens") or 0),
-            )
-            rt.audit(kind="policy", person_id=person.get("person_id"), note=f"added as {role}")
-            return _ok(
-                added=person.get("person_id"),
-                role=role,
-                summary=policy.describe_role(role, person.get("tools")),
-            )
-
-        target = str(args.get("name") or args.get("person") or "").strip()
-        if not target:
-            return _err(f"{action} needs a name (a roster name or a person_id)")
-        matches = store.find_by_name(conn, target)
-        if not matches:
-            return _err(f"no person matches {target!r}")
-        if len(matches) > 1:
-            return _err(
-                f"{target!r} matches more than one person",
-                matches=[{"person_id": m["person_id"], "name": m.get("name")} for m in matches],
-            )
-        person = matches[0]
-        pid = person["person_id"]
-
-        if action == "role":
-            role = policy.normalize_role(args.get("role"))
-            if role not in policy.ROLES:
-                return _err(f"role must be one of {', '.join(policy.ROLES)}")
-            if str(person.get("role")) == "owner" and role != "owner":
-                owners = store.owners(conn)
-                if len(owners) <= 1:
-                    return _err("that is the only owner — promote somebody else first")
-            store.set_role(conn, pid, role)
-            rt.audit(kind="policy", person_id=pid, note=f"role -> {role}")
-            return _ok(person=identity.label(person), person_id=pid, role=role,
-                       summary=policy.describe_role(role, person.get("tools")))
-
-        if action == "tools":
-            tokens = [str(t).strip() for t in (args.get("tools") or []) if str(t).strip()]
-            if not tokens:
-                return _err("tools needs a non-empty tools list")
-            store.set_person_tools(conn, pid, tokens)
-            rt.audit(kind="policy", person_id=pid, note=f"tools -> {tokens}")
-            return _ok(person=identity.label(person), person_id=pid, tools=tokens)
-
-        if action == "remove":
-            if str(person.get("role")) == "owner" and len(store.owners(conn)) <= 1:
-                return _err("removing the only owner would lock everybody out")
-            store.remove_person(conn, pid)
-            rt.audit(kind="policy", person_id=pid, note="removed from roster")
-            return _ok(removed=pid)
-
-        return _err(f"unknown action {action!r}", actions=["list", "add", "role", "tools", "remove"])
+        rows = store.list_people(conn)
+        return _ok(
+            count=len(rows),
+            people=[
+                {
+                    # Only the owner sees the platform ids: a roster is a list of people, not a
+                    # directory of accounts for whoever happens to be talking to the bot.
+                    "person_id": row["person_id"] if viewer_is_owner else None,
+                    "name": row.get("name") or row.get("display") or row.get("sender_id"),
+                    "platform": row.get("platform") if viewer_is_owner else None,
+                    "role": policy.normalize_role(row.get("role")),
+                    "summary": policy.describe_role(row.get("role") or "", row.get("tools")),
+                    "facts": store.count_facts(conn, row["person_id"]),
+                    # Another person's spend is theirs; the owner sees everyone's.
+                    "daily_tokens": (
+                        int(row.get("daily_tokens") or 0) if viewer_is_owner else None
+                    ),
+                    "you": row["person_id"] == caller.get("person_id"),
+                }
+                for row in rows
+            ],
+            open_invites=len(store.open_invites(conn)) if viewer_is_owner else None,
+            note=None
+            if viewer_is_owner
+            else "platform ids and budgets are only shown to the owner; roles and tool counts are "
+            "public inside this chat. Use /many role|tools|budget|remove to change the roster.",
+        )
     except Exception as exc:
         return _err(f"people failed: {exc.__class__.__name__}: {exc}")
 
@@ -347,35 +295,18 @@ WHOAMI_SCHEMA = {
 PEOPLE_SCHEMA = {
     "name": "manyhands_people",
     "description": (
-        "The roster of people this Hermes serves. action=list shows everyone with their role and "
-        "tool count (anyone may run this). add/role/tools/remove change the roster and are "
-        "owner-only: `add` needs platform + sender_id, `role` and `tools` and `remove` take a name "
-        "or person_id. Roles are owner, member, guest, blocked."
+        "The roster of people this Hermes serves: each person's name, role (owner, member, guest, "
+        "blocked), what that role may use, and how many facts they have stored. Read-only — a "
+        "roster change is a human step (`/many add`, `/many role`, `/many tools`, `/many budget`, "
+        "`/many remove` in the owner's own chat), so do not offer to make one."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "add", "role", "tools", "remove"],
-                "description": "list (default), or a roster change (owner only).",
-            },
-            "name": {"type": "string", "description": "Roster name or person_id of the target."},
-            "role": {
-                "type": "string",
-                "enum": ["owner", "member", "guest", "blocked"],
-                "description": "Role to assign (action=role) or the role for a new person.",
-            },
-            "tools": {
-                "type": "array",
-                "items": {"type": "string"},
-                "description": "Explicit tool allowlist for this person (action=tools). Replaces the role default.",
-            },
-            "platform": {"type": "string", "description": "Telegram/Discord/etc. (action=add)."},
-            "sender_id": {"type": "string", "description": "That person's id on the platform (action=add)."},
-            "daily_tokens": {
-                "type": "integer",
-                "description": "Per-day token cap for this person; 0 means unlimited.",
+                "enum": ["list"],
+                "description": "list (the default and the only action).",
             },
         },
         "required": [],

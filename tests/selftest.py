@@ -898,6 +898,74 @@ class ToolIdentity(unittest.TestCase):
         self.assertIn("GH78", json.dumps(theirs))
 
 
+class RosterWrites(unittest.TestCase):
+    """A roster change is a human step. The model cannot promote anybody, on any turn."""
+
+    _src = staticmethod(CommandActor._src)
+
+    def test_the_people_tool_cannot_change_the_roster_even_in_an_owner_turn(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        # an owner's own turn — and a cron/machine turn is the same seat, so it is the strongest case
+        turn(rt, sender="111", session="own-turn", task="t-owner")
+        attempts = (
+            {"action": "add", "platform": "telegram", "sender_id": "999", "role": "owner"},
+            {"action": "add", "platform": "telegram", "sender_id": "999"},
+            {"action": "role", "name": "Guest", "role": "owner"},
+            {"action": "role", "name": "telegram:333", "role": "owner"},
+            {"action": "tools", "name": "Guest", "tools": ["terminal"]},
+            {"action": "remove", "name": "Minh"},
+        )
+        for args in attempts:
+            # called straight on the handler: `name` is a legitimate *argument* of this tool
+            out = json.loads(tools.people(rt, args, session_id="own-turn", task_id="t-owner"))
+            self.assertIn("error", out, args)
+            self.assertIn("read-only", out["error"], args)
+        # and nothing moved: one owner, the guest is still a guest, 999 was never added, nobody lost a row
+        self.assertEqual(len(store.owners(rt.conn)), 1)
+        self.assertEqual(policy.normalize_role(store.get_person(rt.conn, "telegram:333")["role"]), "guest")
+        self.assertIsNone(store.get_person_by_sender(rt.conn, "telegram", "999"))
+        self.assertEqual(store.get_person(rt.conn, "telegram:222")["role"], "member")
+
+    def test_the_people_tool_still_lists_for_anybody(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        turn(rt, sender="222", session="ml", task="t1")
+        listed = json.loads(call_tool(rt, "manyhands_people", session="ml", task="t1"))
+        self.assertEqual(listed["count"], 3)
+        self.assertIsNone(listed["people"][0]["daily_tokens"], "another person's spend is theirs")
+
+    def test_many_add_is_an_owner_typed_verb(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        owner, member = self._src("111"), self._src("222")
+        self.assertIn("only the owner", manyhands._cmd(rt, "add telegram 999 owner", source=member))
+        self.assertIn("usage", manyhands._cmd(rt, "add telegram", source=owner))
+        self.assertIn("role must be one of", manyhands._cmd(rt, "add telegram 999 king", source=owner))
+        added = manyhands._cmd(rt, "add telegram 999 guest", source=owner)
+        self.assertIn("added as guest", added)
+        self.assertNotIn("unknown command", added)
+        self.assertEqual(
+            policy.normalize_role(store.get_person_by_sender(rt.conn, "telegram", "999")["role"]), "guest"
+        )
+        self.assertIn("already on the roster", manyhands._cmd(rt, "add telegram 999 member", source=owner))
+        # the invite reply points at a verb that exists
+        invite = manyhands._cmd(rt, "invite member", source=owner)
+        self.assertIn("/many add <platform> <sender_id> member", invite)
+
+    def test_many_budget_sets_a_daily_cap(self):
+        rt = new_runtime()
+        seed_roster(rt)
+        owner, member = self._src("111"), self._src("222")
+        self.assertIn("only the owner", manyhands._cmd(rt, "budget Minh 100", source=member))
+        self.assertIn("usage", manyhands._cmd(rt, "budget Minh", source=owner))
+        self.assertIn("whole number", manyhands._cmd(rt, "budget Minh lots", source=owner))
+        self.assertIn("no person matches", manyhands._cmd(rt, "budget Nobody 5", source=owner))
+        self.assertIn("100 tokens per UTC day", manyhands._cmd(rt, "budget Minh 100", source=owner))
+        self.assertEqual(int(store.get_person(rt.conn, "telegram:222")["daily_tokens"]), 100)
+        self.assertIn("unlimited", manyhands._cmd(rt, "budget Minh 0", source=owner))
+
+
 class ThreeStates(unittest.TestCase):
     def test_a_member_is_escalated_rather_than_refused(self):
         decision = policy.decide(role="member", tool="terminal")

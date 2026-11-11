@@ -227,7 +227,65 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
             return (
                 f"invite code: `{code}` ({wanted}, single use)\n"
                 f"They reply `join {code}` in this chat — or you can add them directly with "
-                f"`/many add {wanted}`."
+                f"`/many add <platform> <sender_id> {wanted}`."
+            )
+
+        # ---- add (owner) -------------------------------------------------------
+        if verb == "add":
+            # Roster writes are human-typed verbs on purpose: `manyhands_people` is read-only, so the
+            # model cannot promote anybody (see tools.people). This is that path.
+            if not _is_owner(person):
+                return "only the owner can change the roster"
+            parts = rest.split()
+            if len(parts) < 2:
+                return "usage: /many add <platform> <sender_id> [owner|member|guest|blocked]"
+            platform, sender = parts[0].strip().lower(), parts[1].strip()
+            wanted = (parts[2].strip().lower() if len(parts) > 2 else policy.GUEST)
+            if wanted not in policy.ROLES:
+                return f"role must be one of {', '.join(policy.ROLES)}"
+            if not platform or not sender:
+                return "usage: /many add <platform> <sender_id> [owner|member|guest|blocked]"
+            existing = store.get_person_by_sender(rt.conn, platform, sender)
+            if existing:
+                return (
+                    f"**{identity.label(existing)}** is already on the roster as "
+                    f"{policy.normalize_role(existing.get('role'))} — use `/many role` to change it"
+                )
+            created = store.add_person(
+                rt.conn, platform=platform, sender_id=sender, role=wanted, display=sender
+            )
+            rt.audit(
+                kind="policy",
+                person_id=person.get("person_id"),
+                note=f"added {platform}:{sender} as {wanted}",
+            )
+            return (
+                f"**{identity.label(created)}** added as {wanted} ({policy.describe_role(wanted)}) "
+                f"· `{created['person_id']}`"
+            )
+
+        # ---- budget (owner) ----------------------------------------------------
+        if verb in {"budget", "tokens"}:
+            if not _is_owner(person):
+                return "only the owner can set a budget"
+            parts = rest.split()
+            if len(parts) < 2:
+                return "usage: /many budget <name> <tokens per day, 0 = unlimited>"
+            matches = store.find_by_name(rt.conn, parts[0])
+            if not matches:
+                return f"no person matches {parts[0]!r} — `/many roster` lists them"
+            try:
+                cap = int(parts[1])
+            except ValueError:
+                return "tokens must be a whole number (0 = unlimited)"
+            if cap < 0:
+                return "tokens must be 0 or more"
+            target = matches[0]
+            store.set_daily_tokens(rt.conn, target["person_id"], cap)
+            rt.audit(kind="policy", person_id=target["person_id"], note=f"daily budget -> {cap}")
+            return (
+                f"**{identity.label(target)}** budget: "
+                f"{'unlimited' if cap == 0 else str(cap) + ' tokens per UTC day'}"
             )
 
         # ---- approve / deny ----------------------------------------------------
@@ -415,7 +473,8 @@ def _cmd(rt: Runtime, raw_args: str, source: Any = None, session_id: str = "") -
         return (
             f"unknown command `{verb}`\n"
             "`/many whoami · roster · audit [name] [hours] · invite [role] · claim [code] · "
-            "role <name> <role> · tools <name> [add|remove] <tool…> · remove <name> · pause · resume`"
+            "add <platform> <sender_id> [role] · role <name> <role> · tools <name> [add|remove] "
+            "<tool…> · budget <name> <tokens> · remove <name> · pause · resume`"
         )
     except Exception as exc:  # a slash command must never raise into the chat loop
         return f"manyhands: {exc.__class__.__name__}: {exc}"
@@ -496,7 +555,7 @@ def register(ctx) -> None:
         "many",
         command,
         description="Who am I, who is on the roster, and what did I just refuse",
-        args_hint="<whoami | roster | audit [name] [hours] | invite [role] | claim [code] | role | tools | pause | resume>",
+        args_hint="<whoami | roster | audit [name] [hours] | invite [role] | claim [code] | add <platform> <sender_id> [role] | role | tools | budget | remove | pause | resume>",
     )
 
     logger.info(
